@@ -15185,6 +15185,60 @@ void ggml_backend_vk_get_device_description(int device, char * description, size
     ggml_vk_get_device_description(dev_idx, description, description_size);
 }
 
+// ── Keryx zero-dup exports ──────────────────────────────────────────────────
+// Let an external Vulkan compute kernel in the same process (the Keryx PoM walk)
+// read weight tensors resident in this backend's VRAM instead of keeping its own
+// duplicate copy. Buffer device addresses are only dereferenceable on the device
+// that owns them, so the external kernel builds its pipeline on THIS VkDevice and
+// submits through the queue-mutex-guarded hook below.
+
+bool ggml_backend_vk_keryx_raw_handles(size_t dev_num, void ** vk_instance_out,
+                                       void ** vk_physical_device, void ** vk_device_out,
+                                       uint32_t * compute_queue_family_index) {
+    try {
+        ggml_vk_instance_init();
+        if (dev_num >= vk_instance.device_indices.size()) {
+            return false;
+        }
+        vk_device dev = ggml_vk_get_device(vk_instance.device_indices[dev_num]);
+        if (!dev->buffer_device_address) {
+            return false; // no BDA → tensors cannot be reached by raw address
+        }
+        *vk_instance_out            = (void *) (VkInstance) vk_instance.instance;
+        *vk_physical_device         = (void *) (VkPhysicalDevice) dev->physical_device;
+        *vk_device_out              = (void *) (VkDevice) dev->device;
+        *compute_queue_family_index = dev->compute_queue.queue_family_index;
+        return true;
+    } catch (const vk::SystemError &) {
+        return false;
+    }
+}
+
+bool ggml_backend_vk_keryx_tensor_addr(const struct ggml_tensor * tensor,
+                                       uint64_t * gpu_addr, uint64_t * size_bytes) {
+    if (tensor == nullptr || tensor->buffer == nullptr || !ggml_backend_buffer_is_vk(tensor->buffer)) {
+        return false;
+    }
+    ggml_backend_vk_buffer_context * buf_ctx = (ggml_backend_vk_buffer_context *) tensor->buffer->context;
+    const vk_buffer & buf = buf_ctx->dev_buffer;
+    if (!buf || buf->bda_addr == 0) {
+        return false;
+    }
+    // Same resolution ggml_vk_tensor_subbuffer / the in-shader BDA paths use.
+    *gpu_addr   = buf->bda_addr + vk_tensor_offset(tensor) + tensor->view_offs;
+    *size_bytes = ggml_nbytes(tensor);
+    return true;
+}
+
+void ggml_backend_vk_keryx_queue_submit(size_t dev_num, const void * submit_info, void * fence) {
+    vk_device dev = ggml_vk_get_device(vk_instance.device_indices[dev_num]);
+    // Same lock every internal ggml_vk_submit takes: external dispatches can never
+    // race ggml's own submissions on the shared compute queue.
+    std::lock_guard<std::mutex> guard(queue_mutex);
+    dev->compute_queue.queue.submit({ *reinterpret_cast<const vk::SubmitInfo *>(submit_info) },
+                                    vk::Fence((VkFence) fence));
+}
+
 void ggml_backend_vk_get_device_memory(int device, size_t * free, size_t * total) {
     GGML_ASSERT(device < (int) vk_instance.device_indices.size());
     GGML_ASSERT(device < (int) vk_instance.device_supports_membudget.size());

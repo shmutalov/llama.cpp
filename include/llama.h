@@ -654,6 +654,12 @@ extern "C" {
     // Returns the total number of parameters in the model
     LLAMA_API uint64_t llama_model_n_params(const struct llama_model * model);
 
+    // Keryx zero-dup: enumerate the loaded model's weight tensors (name-ordered as
+    // loaded) so an external same-process consumer can map them via the ggml-vulkan
+    // keryx exports. Returns NULL when `i` is out of range.
+    LLAMA_API int32_t                    llama_model_keryx_n_tensors(const struct llama_model * model);
+    LLAMA_API const struct ggml_tensor * llama_model_keryx_tensor  (const struct llama_model * model, int32_t i);
+
     // Returns true if the model contains an encoder that requires llama_encode() call
     LLAMA_API bool llama_model_has_encoder(const struct llama_model * model);
 

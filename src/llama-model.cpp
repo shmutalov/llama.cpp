@@ -3361,6 +3361,17 @@ const std::vector<std::pair<std::string, ggml_tensor *>> & llama_internal_get_te
     return model->tensors_by_name;
 }
 
+int32_t llama_model_keryx_n_tensors(const llama_model * model) {
+    return (int32_t) model->tensors_by_name.size();
+}
+
+const ggml_tensor * llama_model_keryx_tensor(const llama_model * model, int32_t i) {
+    if (i < 0 || (size_t) i >= model->tensors_by_name.size()) {
+        return nullptr;
+    }
+    return model->tensors_by_name[(size_t) i].second;
+}
+
 int32_t llama_model_n_expert(const struct llama_model * model) {
     return model->hparams.n_expert;
 }
