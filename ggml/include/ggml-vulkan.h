@@ -24,6 +24,16 @@ GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_vk_host_buffer_type(voi
 
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_vk_reg(void);
 
+// ── Keryx zero-dup exports: expose resident weight tensors to an external
+// same-process Vulkan compute kernel (see ggml-vulkan.cpp for details) ──────
+GGML_BACKEND_API bool ggml_backend_vk_keryx_raw_handles(size_t dev_num, void ** vk_instance,
+                                                        void ** vk_physical_device, void ** vk_device,
+                                                        uint32_t * compute_queue_family_index);
+GGML_BACKEND_API bool ggml_backend_vk_keryx_tensor_addr(const struct ggml_tensor * tensor,
+                                                        uint64_t * gpu_addr, uint64_t * size_bytes);
+GGML_BACKEND_API void ggml_backend_vk_keryx_queue_submit(size_t dev_num, const void * submit_info, void * fence);
+
+
 #ifdef  __cplusplus
 }
 #endif
