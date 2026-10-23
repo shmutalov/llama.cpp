@@ -747,6 +747,8 @@ struct vk_device_struct {
 
     vk_pipeline pipeline_matmul_split_k_reduce;
     vk_pipeline pipeline_quantize_q8_1_x4;
+    // Keryx canonical trace: BLAKE3 of captured rows (keryx_trace.comp).
+    vk_pipeline pipeline_keryx_trace;
 
     vk_pipeline pipeline_dequant[GGML_TYPE_COUNT];
     vk_pipeline pipeline_dequant_mul_mat_vec_f32_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT][mul_mat_vec_max_cols];
@@ -1677,6 +1679,21 @@ struct vk_quantize_q8_1_push_constants {
     uint32_t num_blocks;
 };
 
+// Must match the push constant block of keryx_trace.comp.
+struct vk_keryx_trace_push_constants {
+    uint32_t src_off;
+    uint32_t row_stride;
+    uint32_t row_bytes;
+    uint32_t kind;
+    uint32_t k_blocks;
+    uint32_t first_pos;
+    uint32_t nl;
+    uint32_t leaf_a;
+    uint32_t leaf_b;
+    uint32_t cap_row;
+    uint32_t cap_off;
+};
+
 struct vk_op_flash_attn_split_k_reduce_push_constants {
     uint32_t D;
     uint32_t ne1;
@@ -2020,7 +2037,49 @@ struct ggml_backend_vk_context {
     std::vector<int> query_node_idx;
     int32_t num_queries {};
     int32_t query_idx {};
+
+    // Keryx canonical trace: the mat-vec node whose src1 the last quantize_q8_1 pass left in
+    // prealloc_y (as block_q8_1_x4), with its row count and length.
+    const ggml_tensor * keryx_q8_node {};
+    uint64_t keryx_q8_rows {};
+    uint64_t keryx_q8_k {};
 };
+
+// ── Keryx canonical trace (verifiable inference) ────────────────────────────
+// While a traced evaluation runs on a device, every matmul of a product named in the configured
+// manifest hashes its q8_1 input rows (CUDA's MMVQ block_q8_1 layout) and its output rows, and the
+// layer residual nodes hash theirs, into per-position leaves (BLAKE3, `keryx_trace.comp`). The
+// trace forces the q8_1 mat-vec path for every product and turns graph fusion off, so each hashed
+// tensor is the one the next op consumed. Batches stay within mat-vec width (<= 8 tokens).
+
+struct vk_keryx_product {
+    int  form;   // 0 none, 1 split GLU, 2 GLU gate, 3 GLU up
+    int  bias;   // manifest index of the bias, -1 none
+    bool head;   // ROLE_OUTPUT: rows only at the output positions
+};
+
+struct vk_keryx_trace {
+    bool on = false;     // configured with a manifest
+    bool armed = false;  // a traced evaluation is running
+    std::unordered_map<std::string, int> rank;
+    std::vector<vk_keryx_product> prod;
+    uint32_t n_products = 0, n_layers = 0, n_router = 0, nl = 0;
+    uint32_t max_pos = 0;
+    uint32_t pos_base = 0, n_tokens = 0, n_pos = 0;
+    std::vector<uint32_t> ubatch;
+    vk_buffer leaves;    // host-visible, [max_pos][nl][8] u32
+    vk_buffer caps;      // host-visible capture slots
+    std::vector<std::pair<uint32_t, uint32_t>> cap_list;  // armed (position, leaf)
+    std::vector<uint32_t> cap_len;
+    uint32_t cap_slot = 0;
+    std::string error;   // first failure of the current evaluation
+};
+
+// Never freed: its buffers must not be released by static destructors after the devices are gone.
+static vk_keryx_trace * const vk_keryx_traces = new vk_keryx_trace[GGML_VK_MAX_DEVICES];
+static std::mutex vk_keryx_mutex;
+
+static bool ggml_vk_keryx_armed(const vk_device & device);
 
 static void * const vk_ptr_base = (void *)(uintptr_t) 0x1000;  // NOLINT
 
@@ -4809,6 +4868,9 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     } else {
         ggml_vk_create_pipeline(device, device->pipeline_quantize_q8_1_x4, "quantize_q8_1_x4", quantize_q8_1_x4_len, quantize_q8_1_x4_data, "main", 2, sizeof(vk_quantize_q8_1_push_constants), {32 * device->subgroup_size / 8, 1, 1}, { device->subgroup_size }, 1);
     }
+
+    // One workgroup per row.
+    ggml_vk_create_pipeline(device, device->pipeline_keryx_trace, "keryx_trace", keryx_trace_len, keryx_trace_data, "main", 3, sizeof(vk_keryx_trace_push_constants), {1, 1, 1}, {}, 1);
 
     for (uint32_t i = 0; i < p021_max_gqa_ratio; ++i) {
         if (device->subgroup_arithmetic && device->subgroup_require_full_support) {
@@ -8419,7 +8481,8 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
 
 // Device tuning
 static bool ggml_vk_should_use_mmvq(const vk_device& device, uint32_t m, uint32_t n, uint32_t k, ggml_type src0_type) {
-    if (device->mmvq_mode == 1) {
+    // The canonical trace commits q8_1 inputs: every product takes the q8_1 mat-vec path.
+    if (device->mmvq_mode == 1 || ggml_vk_keryx_armed(device)) {
         return true;
     } else if (device->mmvq_mode == -1) {
         return false;
@@ -8661,6 +8724,10 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
             ctx->prealloc_y_last_pipeline_used = to_q8_1.get();
             ctx->prealloc_y_last_tensor_used = src1;
         }
+        // Keryx canonical trace: prealloc_y now holds this node's q8_1 input rows.
+        ctx->keryx_q8_node = dst;
+        ctx->keryx_q8_rows = ne11 * ne12 * ne13;
+        ctx->keryx_q8_k = ne10;
     }
 
     // For batch_n, the A matrix is the same for each batch, and B/D use the row stride as the batch stride
@@ -13752,6 +13819,185 @@ static void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_contex
 
 static void ggml_vk_compute_forward(ggml_backend_vk_context* ctx, ggml_cgraph * cgraph, ggml_tensor* tensor, int tensor_idx, bool almost_ready);
 
+// ── Keryx canonical trace: hooks ────────────────────────────────────────────
+
+static constexpr uint32_t VK_KERYX_NO_LEAF = 0xFFFFFFFFu;
+static constexpr uint32_t VK_KERYX_KIND_ROWS = 0;
+static constexpr uint32_t VK_KERYX_KIND_Q8 = 1;
+static constexpr uint32_t VK_KERYX_COPY = 0x100;
+// keryx_trace.comp folds at most 1024 chunks of 1 KiB per row.
+static constexpr uint64_t VK_KERYX_MAX_ROW_BYTES = 1024 * 1024;
+
+static bool ggml_vk_keryx_armed(const vk_device & device) {
+    return device && device->idx < GGML_VK_MAX_DEVICES && vk_keryx_traces[device->idx].armed;
+}
+
+static void ggml_vk_keryx_fail(vk_keryx_trace & t, const std::string & why) {
+    if (t.error.empty()) {
+        t.error = why;
+    }
+}
+
+// Records the BLAKE3 of `nrows` canonical rows of `src` as leaves `leaf_a`/`leaf_b` (-1 = none) of
+// positions `first_pos`.., and copies the rows an armed capture names. KIND_ROWS rows start at word
+// `src_off + row * row_stride`; KIND_Q8 rows are `k_blocks` q8_1 blocks each, packed from word
+// `src_off` as block_q8_1_x4 groups. Synchronized on both sides: the rows were written by the
+// previous dispatch, and later nodes may reuse their memory.
+static void ggml_vk_keryx_rows(ggml_backend_vk_context * ctx, vk_context & subctx, vk_keryx_trace & t, const vk_subbuffer & src,
+                               uint32_t src_off, uint32_t row_stride, uint64_t row_bytes, uint32_t kind, uint32_t k_blocks,
+                               uint64_t nrows, uint64_t first_pos, int leaf_a, int leaf_b, const char * what) {
+    if (nrows == 0) {
+        return;
+    }
+    if (row_bytes == 0 || row_bytes % 4 != 0 || row_bytes > VK_KERYX_MAX_ROW_BYTES) {
+        ggml_vk_keryx_fail(t, std::string("unsupported row of ") + std::to_string(row_bytes) + " bytes in " + what);
+        return;
+    }
+    if (first_pos + nrows > t.max_pos) {
+        ggml_vk_keryx_fail(t, "the evaluation passes the " + std::to_string(t.max_pos) + " traced positions");
+        return;
+    }
+    std::vector<std::pair<uint32_t, uint32_t>> copies;  // (row, capture slot)
+    for (size_t k = 0; k < t.cap_list.size(); k++) {
+        const uint64_t pos = t.cap_list[k].first;
+        const int leaf = (int) t.cap_list[k].second;
+        if (pos >= first_pos && pos < first_pos + nrows && (leaf == leaf_a || leaf == leaf_b)) {
+            if (row_bytes > t.cap_slot) {
+                ggml_vk_keryx_fail(t, std::string("capture of ") + what + " exceeds its slot");
+                continue;
+            }
+            copies.push_back({ (uint32_t) (pos - first_pos), (uint32_t) k });
+        }
+    }
+    vk_pipeline & pipe = ctx->device->pipeline_keryx_trace;
+    const vk_subbuffer leaves = { t.leaves, 0, t.leaves->size };
+    // Binding 2 must hold a buffer even when nothing is captured.
+    const vk_subbuffer caps = t.caps ? vk_subbuffer{ t.caps, 0, t.caps->size } : leaves;
+    ggml_pipeline_request_descriptor_sets(ctx, pipe, 1 + (uint32_t) copies.size());
+    ggml_vk_sync_buffers(ctx, subctx);
+    vk_keryx_trace_push_constants pc = {
+        src_off, row_stride, (uint32_t) row_bytes, kind, k_blocks, (uint32_t) first_pos, t.nl,
+        leaf_a < 0 ? VK_KERYX_NO_LEAF : (uint32_t) leaf_a, leaf_b < 0 ? VK_KERYX_NO_LEAF : (uint32_t) leaf_b, 0, 0,
+    };
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipe, { src, leaves, caps }, pc, { (uint32_t) nrows, 1, 1 });
+    for (const auto & c : copies) {
+        vk_keryx_trace_push_constants cp = pc;
+        cp.kind = kind | VK_KERYX_COPY;
+        cp.cap_row = c.first;
+        cp.cap_off = c.second * (t.cap_slot / 4);
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipe, { src, leaves, caps }, cp, { 1, 1, 1 });
+        t.cap_len[c.second] = (uint32_t) row_bytes;
+    }
+    ggml_vk_sync_buffers(ctx, subctx);
+}
+
+// The f32 rows of `x` as leaf `leaf` of positions `first_pos`...
+static void ggml_vk_keryx_tensor_rows(ggml_backend_vk_context * ctx, vk_context & subctx, vk_keryx_trace & t, const ggml_tensor * x,
+                                      int leaf, uint64_t first_pos) {
+    if (x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x)) {
+        ggml_vk_keryx_fail(t, std::string("traced tensor ") + x->name + " is not contiguous f32");
+        return;
+    }
+    const vk_subbuffer sb = ggml_vk_tensor_subbuffer(ctx, x, true);
+    const uint64_t misalign = vk_tensor_offset(x) + x->view_offs - sb.offset;
+    ggml_vk_keryx_rows(ctx, subctx, t, sb, (uint32_t) (misalign / 4), (uint32_t) x->ne[0], (uint64_t) x->ne[0] * 4, VK_KERYX_KIND_ROWS, 0,
+                       (uint64_t) ggml_nrows(x), first_pos, leaf, -1, x->name);
+}
+
+// Rows of a traced tensor sit at the last positions of the batch when it holds fewer rows (the
+// output rows of the head, a trimmed last layer).
+static uint64_t ggml_vk_keryx_first_pos(const vk_keryx_trace & t, uint64_t nrows) {
+    return t.pos_base + (t.n_tokens > nrows ? t.n_tokens - nrows : 0);
+}
+
+// Manifest rank of the product `w` is a weight of, or -1.
+static int ggml_vk_keryx_rank(const vk_keryx_trace & t, const ggml_tensor * w) {
+    if (!w) {
+        return -1;
+    }
+    const auto it = t.rank.find(w->name);
+    return it == t.rank.end() ? -1 : it->second;
+}
+
+// Residual leaf of a layer-stream node named `<kind>-<layer>`, or -1.
+static int ggml_vk_keryx_resid_leaf(const vk_keryx_trace & t, const char * name) {
+    const char * dash = strrchr(name, '-');
+    if (t.n_layers == 0 || !dash || dash[1] < '0' || dash[1] > '9') {
+        return -1;
+    }
+    char * end = nullptr;
+    const unsigned long il = strtoul(dash + 1, &end, 10);
+    if (*end != '\0' || il >= t.n_layers) {
+        return -1;
+    }
+    const size_t n = (size_t) (dash - name);
+    auto is = [&](const char * k) { return strlen(k) == n && strncmp(name, k, n) == 0; };
+    const int base = (int) (2 * t.n_products + 2 * il);
+    if (is("l_out")) {
+        return base + 1;
+    }
+    if (is("attn_residual") || is("ffn_inp") || is("attn_out")) {
+        return base;
+    }
+    if (t.n_router > 0 && is("ffn_moe_logits")) {
+        return (int) (2 * t.n_products + 2 * t.n_layers + il);
+    }
+    return -1;
+}
+
+// After `node`'s own dispatch: the leaves it carries. A product matmul carries its q8_1 input rows
+// (and its output rows when the product is plain); the GLU of a gated pair or split product, or
+// the bias add of a biased one, carries that product's output; a residual node carries its rows.
+static void ggml_vk_keryx_on_node(ggml_backend_vk_context * ctx, vk_context & subctx, const ggml_tensor * node) {
+    vk_keryx_trace & t = vk_keryx_traces[ctx->device->idx];
+    if (node->op == GGML_OP_MUL_MAT) {
+        // Consumed here, so a later evaluation of the same graph cannot mistake it for its own.
+        const bool q8 = ctx->keryx_q8_node == node;
+        ctx->keryx_q8_node = nullptr;
+        const int r = ggml_vk_keryx_rank(t, node->src[0]);
+        if (r >= 0) {
+            const vk_keryx_product & p = t.prod[r];
+            if (!q8) {
+                ggml_vk_keryx_fail(t, std::string("product ") + node->src[0]->name + " did not take the q8_1 mat-vec path");
+                return;
+            }
+            const uint64_t k = ctx->keryx_q8_k, rows = ctx->keryx_q8_rows;
+            const uint64_t kp = (k + 511) / 512 * 512;
+            const uint64_t first = p.head ? ggml_vk_keryx_first_pos(t, rows) : t.pos_base;
+            const vk_subbuffer y = { ctx->prealloc_y, 0, ctx->prealloc_y->size };
+            ggml_vk_keryx_rows(ctx, subctx, t, y, 0, 0, kp / 32 * 36, VK_KERYX_KIND_Q8, (uint32_t) (k / 32), rows, first, 2 * r, -1,
+                               node->src[0]->name);
+            if (p.form == 0 && p.bias < 0) {
+                ggml_vk_keryx_tensor_rows(ctx, subctx, t, node, 2 * r + 1, p.head ? ggml_vk_keryx_first_pos(t, ggml_nrows(node)) : t.pos_base);
+            }
+        }
+    } else if (node->op == GGML_OP_GLU) {
+        for (int s = 0; s < 2; s++) {
+            const ggml_tensor * mm = node->src[s];
+            if (!mm || mm->op != GGML_OP_MUL_MAT) {
+                continue;
+            }
+            const int r = ggml_vk_keryx_rank(t, mm->src[0]);
+            if (r >= 0 && (t.prod[r].form == 1 || t.prod[r].form == 2)) {
+                ggml_vk_keryx_tensor_rows(ctx, subctx, t, node, 2 * r + 1,
+                                          t.prod[r].head ? ggml_vk_keryx_first_pos(t, ggml_nrows(node)) : t.pos_base);
+                break;
+            }
+        }
+    } else if (node->op == GGML_OP_ADD && node->src[0] && node->src[0]->op == GGML_OP_MUL_MAT && node->src[1]) {
+        const int r = ggml_vk_keryx_rank(t, node->src[0]->src[0]);
+        const char * bn = node->src[1]->name;
+        const size_t l = strlen(bn);
+        if (r >= 0 && t.prod[r].form == 0 && t.prod[r].bias >= 0 && l > 5 && strcmp(bn + l - 5, ".bias") == 0) {
+            ggml_vk_keryx_tensor_rows(ctx, subctx, t, node, 2 * r + 1, t.prod[r].head ? ggml_vk_keryx_first_pos(t, ggml_nrows(node)) : t.pos_base);
+        }
+    }
+    const int leaf = ggml_vk_keryx_resid_leaf(t, node->name);
+    if (leaf >= 0) {
+        ggml_vk_keryx_tensor_rows(ctx, subctx, t, node, leaf, ggml_vk_keryx_first_pos(t, ggml_nrows(node)));
+    }
+}
+
 // Returns true if node has enqueued work into the queue, false otherwise
 // If submit is true the current all operations queued so far are being submitted to Vulkan to overlap cmdlist creation and GPU execution.
 static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, int node_idx, ggml_tensor *node_begin, int node_idx_begin, bool last_node, bool almost_ready, bool submit){
@@ -13777,7 +14023,7 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
             cgraph->nodes[next_node_idx]->op == GGML_OP_RMS_NORM &&
             cgraph->nodes[next_node_idx]->src[0] == cgraph->nodes[next_node_idx - 1] &&
             ggml_nrows(cgraph->nodes[next_node_idx]) == 1 &&
-            ctx->device->add_rms_fusion) {
+            ctx->device->add_rms_fusion && !ggml_vk_keryx_armed(ctx->device)) {
             uint32_t size = ggml_vk_rms_partials_size(ctx, cgraph->nodes[node_idx]);
             ctx->do_add_rms_partials_offset_calculation = true;
             if (ctx->prealloc_size_add_rms_partials_offset + size <= ctx->prealloc_size_add_rms_partials) {
@@ -14230,6 +14476,10 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
         break;
     default:
         return false;
+    }
+
+    if (ggml_vk_keryx_armed(ctx->device)) {
+        ggml_vk_keryx_on_node(ctx, compute_ctx, node);
     }
 
     ctx->tensor_ctxs[node_idx] = compute_ctx;
@@ -15578,7 +15828,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_topk_moe_mode = TOPK_MOE_COUNT;
         ctx->fused_topk_moe_scale = false;
         const char *fusion_string {};
-        if (!ctx->device->disable_fusion) {
+        // A traced evaluation hashes every node's own output: nothing is fused.
+        if (!ctx->device->disable_fusion && !ggml_vk_keryx_armed(ctx->device)) {
             uint32_t num_adds = ggml_vk_fuse_multi_add(ctx, cgraph, i);
             if (num_adds) {
                 ctx->num_additional_fused_ops = num_adds - 1;
@@ -16298,6 +16549,298 @@ void ggml_backend_vk_keryx_queue_submit(size_t dev_num, const void * submit_info
     std::lock_guard<std::mutex> guard(queue_mutex);
     dev->compute_queue.queue.submit({ *reinterpret_cast<const vk::SubmitInfo *>(submit_info) },
                                     vk::Fence((VkFence) fence));
+}
+
+// ── Keryx canonical trace: control ─────────────────────────────────────────
+// Driven by the miner around a traced evaluation: configure once per manifest, then begin, announce
+// each batch before its decode, end, read. A replay arms its captures after begin. Every call returns
+// 0 on success and a negative code otherwise; ggml_backend_vk_keryx_trace_error explains the last
+// evaluation's failure.
+
+static vk_device ggml_vk_keryx_device(size_t dev_num) {
+    ggml_vk_instance_init();
+    if (dev_num >= vk_instance.device_indices.size()) {
+        return nullptr;
+    }
+    vk_device dev = ggml_vk_get_device(vk_instance.device_indices[dev_num]);
+    return dev && dev->idx < GGML_VK_MAX_DEVICES ? dev : nullptr;
+}
+
+// Product ranks, forms and the leaf layout of a serialized manifest (`KXMANIF1`/`KXMANIF2`).
+static bool ggml_vk_keryx_load_manifest(vk_keryx_trace & s, const uint8_t * b, size_t len) {
+    if (len < 16 || (memcmp(b, "KXMANIF1", 8) != 0 && memcmp(b, "KXMANIF2", 8) != 0)) {
+        return false;
+    }
+    const bool chain = b[7] == '2';
+    uint32_t n_entries, n_products;
+    memcpy(&n_entries, &b[8], 4);
+    memcpy(&n_products, &b[12], 4);
+    if (n_products == 0 || n_products > n_entries) {
+        return false;
+    }
+    uint32_t n_layers = 0;
+    bool moe = false;
+    size_t o = 16;
+    for (uint32_t i = 0; i < n_entries; ++i) {
+        if (o + 2 > len) {
+            return false;
+        }
+        uint16_t nl;
+        memcpy(&nl, &b[o], 2);
+        if (o + 2 + nl + 55 > len) {
+            return false;
+        }
+        std::string name((const char *) &b[o + 2], nl);
+        const uint8_t * r = &b[o + 2 + nl];
+        const uint8_t role = r[44], form = r[46];
+        uint32_t bias;
+        memcpy(&bias, &r[51], 4);
+        if (i < n_products) {
+            s.rank[name] = (int) i;
+            s.prod.push_back({ form, bias == 0xFFFFFFFFu ? -1 : (int) bias, role == 2 });
+        }
+        o += 2 + nl + 55;
+        if (chain) {
+            if (o >= len) {
+                return false;
+            }
+            const uint8_t tag = b[o];
+            const size_t ext = tag == 0 ? 1 : tag == 1 ? 14 : tag == 2 ? 25 : tag == 3 ? 49 : 0;
+            if (ext == 0 || o + ext > len) {
+                return false;
+            }
+            if (tag >= 2) {
+                uint32_t layer;
+                memcpy(&layer, &b[o + 1], 4);
+                if (layer != n_layers) {
+                    return false;
+                }
+                n_layers++;
+                moe = moe || tag == 3;
+            }
+            o += ext;
+        }
+    }
+    s.n_products = n_products;
+    s.n_layers   = n_layers;
+    s.n_router   = moe ? n_layers : 0;
+    s.nl = 2 * n_products + 2 * n_layers + s.n_router + 1;
+    return true;
+}
+
+static vk_buffer ggml_vk_keryx_host_buffer(vk_device & dev, size_t size) {
+    return ggml_vk_create_buffer(dev, size, { vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent | vk::MemoryPropertyFlagBits::eHostCached,
+                                              vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent });
+}
+
+int ggml_backend_vk_keryx_trace_configure(size_t dev_num, const void * manifest, size_t manifest_len, uint32_t max_pos) {
+    vk_device dev = ggml_vk_keryx_device(dev_num);
+    if (!dev || !manifest || max_pos == 0) {
+        return -1;
+    }
+    std::lock_guard<std::mutex> g(vk_keryx_mutex);
+    vk_keryx_trace fresh;
+    if (!ggml_vk_keryx_load_manifest(fresh, (const uint8_t *) manifest, manifest_len)) {
+        return -4;
+    }
+    fresh.max_pos = max_pos;
+    try {
+        fresh.leaves = ggml_vk_keryx_host_buffer(dev, (size_t) max_pos * fresh.nl * 32);
+    } catch (const std::exception &) {
+        return -3;
+    }
+    if (!fresh.leaves || !fresh.leaves->ptr) {
+        return -3;
+    }
+    fresh.on = true;
+    vk_keryx_traces[dev->idx] = std::move(fresh);
+    return 0;
+}
+
+void ggml_backend_vk_keryx_trace_release(size_t dev_num) {
+    vk_device dev = ggml_vk_keryx_device(dev_num);
+    if (!dev) {
+        return;
+    }
+    std::lock_guard<std::mutex> g(vk_keryx_mutex);
+    vk_keryx_traces[dev->idx] = vk_keryx_trace();
+}
+
+int ggml_backend_vk_keryx_trace_leaf_count(size_t dev_num) {
+    vk_device dev = ggml_vk_keryx_device(dev_num);
+    if (!dev) {
+        return -1;
+    }
+    std::lock_guard<std::mutex> g(vk_keryx_mutex);
+    const vk_keryx_trace & t = vk_keryx_traces[dev->idx];
+    return t.on ? (int) t.nl : -1;
+}
+
+int ggml_backend_vk_keryx_trace_max_pos(size_t dev_num) {
+    vk_device dev = ggml_vk_keryx_device(dev_num);
+    if (!dev) {
+        return -1;
+    }
+    std::lock_guard<std::mutex> g(vk_keryx_mutex);
+    const vk_keryx_trace & t = vk_keryx_traces[dev->idx];
+    return t.on ? (int) t.max_pos : -1;
+}
+
+int ggml_backend_vk_keryx_trace_begin(size_t dev_num) {
+    vk_device dev = ggml_vk_keryx_device(dev_num);
+    if (!dev) {
+        return -1;
+    }
+    std::lock_guard<std::mutex> g(vk_keryx_mutex);
+    vk_keryx_trace & t = vk_keryx_traces[dev->idx];
+    if (!t.on) {
+        return -1;
+    }
+    memset(t.leaves->ptr, 0, t.leaves->size);
+    t.ubatch.assign(t.max_pos, 0);
+    t.pos_base = t.n_tokens = t.n_pos = 0;
+    t.cap_list.clear();
+    t.cap_len.clear();
+    t.cap_slot = 0;
+    t.error.clear();
+    t.armed = true;
+    return 0;
+}
+
+int ggml_backend_vk_keryx_trace_ubatch(size_t dev_num, uint32_t pos_base, uint32_t n_tokens) {
+    vk_device dev = ggml_vk_keryx_device(dev_num);
+    if (!dev) {
+        return -1;
+    }
+    std::lock_guard<std::mutex> g(vk_keryx_mutex);
+    vk_keryx_trace & t = vk_keryx_traces[dev->idx];
+    if (!t.armed || n_tokens == 0) {
+        return -1;
+    }
+    if ((uint64_t) pos_base + n_tokens > t.max_pos) {
+        ggml_vk_keryx_fail(t, "the evaluation passes the " + std::to_string(t.max_pos) + " traced positions");
+        return -5;
+    }
+    t.pos_base = pos_base;
+    t.n_tokens = n_tokens;
+    for (uint32_t p = pos_base; p < pos_base + n_tokens; ++p) {
+        t.ubatch[p] = n_tokens;
+    }
+    t.n_pos = std::max(t.n_pos, pos_base + n_tokens);
+    return 0;
+}
+
+int ggml_backend_vk_keryx_trace_end(size_t dev_num) {
+    vk_device dev = ggml_vk_keryx_device(dev_num);
+    if (!dev) {
+        return -1;
+    }
+    {
+        // Every dispatch of the evaluation has landed before its leaves are read.
+        std::lock_guard<std::mutex> q(queue_mutex);
+        dev->compute_queue.queue.waitIdle();
+    }
+    std::lock_guard<std::mutex> g(vk_keryx_mutex);
+    vk_keryx_trace & t = vk_keryx_traces[dev->idx];
+    t.armed = false;
+    return t.error.empty() ? 0 : -9;
+}
+
+int ggml_backend_vk_keryx_trace_read(size_t dev_num, uint8_t * leaves, size_t leaves_cap, uint32_t * ubatch, size_t ubatch_cap,
+                                     uint32_t * n_pos) {
+    vk_device dev = ggml_vk_keryx_device(dev_num);
+    if (!dev || !n_pos) {
+        return -1;
+    }
+    std::lock_guard<std::mutex> g(vk_keryx_mutex);
+    const vk_keryx_trace & t = vk_keryx_traces[dev->idx];
+    if (!t.on) {
+        return -1;
+    }
+    *n_pos = t.n_pos;
+    if (!t.error.empty()) {
+        return -9;
+    }
+    if (!leaves || !ubatch) {
+        return 0;
+    }
+    const size_t need = (size_t) t.n_pos * t.nl * 32;
+    if (leaves_cap < need || ubatch_cap < t.n_pos) {
+        return -6;
+    }
+    memcpy(leaves, t.leaves->ptr, need);
+    memcpy(ubatch, t.ubatch.data(), (size_t) t.n_pos * 4);
+    return 0;
+}
+
+int ggml_backend_vk_keryx_trace_arm_captures(size_t dev_num, const uint32_t * pos, const uint32_t * leaf, uint32_t n, uint32_t slot_bytes) {
+    vk_device dev = ggml_vk_keryx_device(dev_num);
+    if (!dev || !pos || !leaf || n == 0 || n > 64 || slot_bytes == 0 || slot_bytes % 4 != 0) {
+        return -1;
+    }
+    std::lock_guard<std::mutex> g(vk_keryx_mutex);
+    vk_keryx_trace & t = vk_keryx_traces[dev->idx];
+    if (!t.armed) {
+        return -1;
+    }
+    const size_t need = (size_t) n * slot_bytes;
+    if (!t.caps || t.caps->size < need) {
+        t.caps.reset();
+        try {
+            t.caps = ggml_vk_keryx_host_buffer(dev, need);
+        } catch (const std::exception &) {
+            return -3;
+        }
+        if (!t.caps || !t.caps->ptr) {
+            t.caps.reset();
+            return -3;
+        }
+    }
+    t.cap_list.clear();
+    for (uint32_t k = 0; k < n; ++k) {
+        t.cap_list.push_back({ pos[k], leaf[k] });
+    }
+    t.cap_len.assign(n, 0);
+    t.cap_slot = slot_bytes;
+    return 0;
+}
+
+int ggml_backend_vk_keryx_trace_read_captures(size_t dev_num, uint8_t * out, size_t out_cap, uint32_t * lens, uint32_t n) {
+    vk_device dev = ggml_vk_keryx_device(dev_num);
+    if (!dev || !out || !lens) {
+        return -1;
+    }
+    std::lock_guard<std::mutex> g(vk_keryx_mutex);
+    vk_keryx_trace & t = vk_keryx_traces[dev->idx];
+    if (n == 0 || n != t.cap_list.size()) {
+        return -1;
+    }
+    int rc = t.error.empty() ? 0 : -9;
+    for (uint32_t k = 0; k < n; ++k) {
+        lens[k] = t.cap_len[k];
+        const size_t off = (size_t) k * t.cap_slot;
+        if (t.cap_len[k] == 0) {
+            rc = rc ? rc : -7;
+        } else if (off + t.cap_len[k] > out_cap) {
+            rc = rc ? rc : -6;
+        } else {
+            memcpy(out + off, (const uint8_t *) t.caps->ptr + off, t.cap_len[k]);
+        }
+    }
+    t.cap_list.clear();
+    t.cap_len.clear();
+    return rc;
+}
+
+const char * ggml_backend_vk_keryx_trace_error(size_t dev_num) {
+    static thread_local std::string last;
+    vk_device dev = ggml_vk_keryx_device(dev_num);
+    if (!dev) {
+        return "no such Vulkan device";
+    }
+    std::lock_guard<std::mutex> g(vk_keryx_mutex);
+    last = vk_keryx_traces[dev->idx].error;
+    return last.c_str();
 }
 
 void ggml_backend_vk_get_device_memory(int device, size_t * free, size_t * total) {
