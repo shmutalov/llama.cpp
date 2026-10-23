@@ -376,7 +376,15 @@ FLOAT_TYPE mmvq_dot_product(const uint ib_a, const uint iqs) {
     q_sum += dotPacked4x8EXT(qs_a.z, cache_b_qs[2]);
     q_sum += dotPacked4x8EXT(qs_a.w, cache_b_qs[3]);
 
-    return FLOAT_TYPE(float(cache_b_ds.x) * float(dm_scale.x) * float(q_sum) - float(dm_scale.y) * float(cache_b_ds.y / 2));
+    // Keryx canonical trace: the min term takes the exact sum of these 16 quantized activations,
+    // as CUDA's MMVQ does, not half of the block's stored f16 sum — that rounding alone exceeds the
+    // tolerance verifiable inference recomputes an output element to.
+    int32_t q8_sum = dotPacked4x8EXT(0x01010101, cache_b_qs[0]);
+    q8_sum += dotPacked4x8EXT(0x01010101, cache_b_qs[1]);
+    q8_sum += dotPacked4x8EXT(0x01010101, cache_b_qs[2]);
+    q8_sum += dotPacked4x8EXT(0x01010101, cache_b_qs[3]);
+
+    return FLOAT_TYPE(float(cache_b_ds.x) * (float(dm_scale.x) * float(q_sum) - float(dm_scale.y) * float(q8_sum)));
 }
 #endif
 
