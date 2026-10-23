@@ -15190,7 +15190,7 @@ void ggml_backend_vk_get_device_description(int device, char * description, size
 // read weight tensors resident in this backend's VRAM instead of keeping its own
 // duplicate copy. Buffer device addresses are only dereferenceable on the device
 // that owns them, so the external kernel builds its pipeline on THIS VkDevice and
-// submits through the queue-mutex-guarded hook below.
+// submits through the guarded submit hook below.
 
 bool ggml_backend_vk_keryx_raw_handles(size_t dev_num, void ** vk_instance_out,
                                        void ** vk_physical_device, void ** vk_device_out,
@@ -15207,7 +15207,7 @@ bool ggml_backend_vk_keryx_raw_handles(size_t dev_num, void ** vk_instance_out,
         *vk_instance_out            = (void *) (VkInstance) vk_instance.instance;
         *vk_physical_device         = (void *) (VkPhysicalDevice) dev->physical_device;
         *vk_device_out              = (void *) (VkDevice) dev->device;
-        *compute_queue_family_index = dev->compute_queue.queue_family_index;
+        *compute_queue_family_index = dev->compute_queue->queue_family_index;
         return true;
     } catch (const vk::SystemError &) {
         return false;
@@ -15232,11 +15232,11 @@ bool ggml_backend_vk_keryx_tensor_addr(const struct ggml_tensor * tensor,
 
 void ggml_backend_vk_keryx_queue_submit(size_t dev_num, const void * submit_info, void * fence) {
     vk_device dev = ggml_vk_get_device(vk_instance.device_indices[dev_num]);
-    // Same lock every internal ggml_vk_submit takes: external dispatches can never
-    // race ggml's own submissions on the shared compute queue.
-    std::lock_guard<std::mutex> guard(queue_mutex);
-    dev->compute_queue.queue.submit({ *reinterpret_cast<const vk::SubmitInfo *>(submit_info) },
-                                    vk::Fence((VkFence) fence));
+    // The queue handle's own submit takes the lock every internal ggml_vk_submit takes (none
+    // when the queue is internally synchronized): external dispatches can never race ggml's own
+    // submissions on the shared compute queue.
+    dev->compute_queue->handle->submit({ *reinterpret_cast<const vk::SubmitInfo *>(submit_info) },
+                                       vk::Fence((VkFence) fence));
 }
 
 void ggml_backend_vk_get_device_memory(int device, size_t * free, size_t * total) {
