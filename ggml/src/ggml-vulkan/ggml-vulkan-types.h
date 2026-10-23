@@ -809,6 +809,8 @@ struct vk_device_struct {
 
     vk_pipeline pipeline_matmul_split_k_reduce;
     vk_pipeline pipeline_quantize_q8_1_x4;
+    // Keryx canonical trace: BLAKE3 of captured rows (keryx_trace.comp).
+    vk_pipeline pipeline_keryx_trace;
 
     vk_pipeline pipeline_dequant[GGML_TYPE_COUNT];
     vk_pipeline pipeline_dequant_transpose[GGML_TYPE_COUNT]; // fused dequant+transpose for FA quant-KV
@@ -1316,6 +1318,12 @@ struct ggml_backend_vk_context {
     std::vector<int> query_node_idx;
     int32_t num_queries {};
     int32_t query_idx {};
+
+    // Keryx canonical trace: the mat-vec node whose src1 the last quantize_q8_1 pass left in
+    // prealloc_y (as block_q8_1_x4), with its row count and length.
+    const ggml_tensor * keryx_q8_node {};
+    uint64_t keryx_q8_rows {};
+    uint64_t keryx_q8_k {};
 };
 
 struct ggml_backend_vk_buffer_context {

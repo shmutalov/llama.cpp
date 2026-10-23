@@ -860,6 +860,21 @@ struct vk_quantize_q8_1_push_constants {
     uint32_t num_blocks;
 };
 
+// Must match the push constant block of keryx_trace.comp.
+struct vk_keryx_trace_push_constants {
+    uint32_t src_off;
+    uint32_t row_stride;
+    uint32_t row_bytes;
+    uint32_t kind;
+    uint32_t k_blocks;
+    uint32_t first_pos;
+    uint32_t nl;
+    uint32_t leaf_a;
+    uint32_t leaf_b;
+    uint32_t cap_row;
+    uint32_t cap_off;
+};
+
 struct vk_op_flash_attn_split_k_reduce_push_constants {
     uint32_t D;
     uint32_t ne1;

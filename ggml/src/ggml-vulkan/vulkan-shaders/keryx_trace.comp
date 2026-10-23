@@ -1,0 +1,190 @@
+#version 450
+
+// Keryx canonical trace (verifiable inference): BLAKE3 of each row of a captured tensor, written to
+// its leaf in the trace, or — in copy mode — the canonical bytes of one row, for an opening.
+//
+// A row is read in its canonical byte form:
+//   KIND_ROWS: the row's own words (f32 outputs and residuals);
+//   KIND_Q8:   a q8_1 activation row held as block_q8_1_x4 groups (4 x f16vec2 ds, then 128 int8),
+//              re-laid as 36-byte block_q8_1 (ds, 32 int8) blocks, zero blocks past `k_blocks` (the
+//              row is padded to a multiple of 512 values, as CUDA's MMVQ layout is).
+// One workgroup hashes one row: each invocation compresses whole 1 KiB chunks, then the chunk
+// chaining values are folded pairwise (an odd last node carries up), which is BLAKE3's tree.
+
+#extension GL_EXT_control_flow_attributes : require
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer Src { uint src[]; };
+layout(binding = 1) buffer Leaves { uint leaves[]; };
+layout(binding = 2) writeonly buffer Cap { uint cap[]; };
+
+layout(push_constant) uniform parameter {
+    uint src_off;     // word offset of row 0 in src
+    uint row_stride;  // words between consecutive rows in src
+    uint row_bytes;   // canonical bytes per row (a multiple of 4)
+    uint kind;        // KIND_ROWS or KIND_Q8, | COPY_MODE
+    uint k_blocks;    // KIND_Q8: real 32-value blocks per row
+    uint first_pos;   // trace position of row 0
+    uint nl;          // leaves per position
+    uint leaf_a;      // leaf index, NO_LEAF for none
+    uint leaf_b;
+    uint cap_row;     // COPY_MODE: the row copied
+    uint cap_off;     // COPY_MODE: word offset in cap
+} p;
+
+#define KIND_ROWS 0u
+#define KIND_Q8 1u
+#define COPY_MODE 0x100u
+#define NO_LEAF 0xFFFFFFFFu
+#define MAX_CHUNKS 1024u
+
+#define CHUNK_START 1u
+#define CHUNK_END 2u
+#define PARENT 4u
+#define ROOT 8u
+
+const uint IV[8] = uint[8](0x6A09E667u, 0xBB67AE85u, 0x3C6EF372u, 0xA54FF53Au,
+                           0x510E527Fu, 0x9B05688Cu, 0x1F83D9ABu, 0x5BE0CD19u);
+
+shared uint cvs[MAX_CHUNKS * 8u];
+
+uint rotr(uint x, uint n) {
+    return (x >> n) | (x << (32u - n));
+}
+
+#define G(a, b, c, d, mx, my) \
+    v[a] += v[b] + (mx); v[d] = rotr(v[d] ^ v[a], 16u); \
+    v[c] += v[d];        v[b] = rotr(v[b] ^ v[c], 12u); \
+    v[a] += v[b] + (my); v[d] = rotr(v[d] ^ v[a], 8u);  \
+    v[c] += v[d];        v[b] = rotr(v[b] ^ v[c], 7u)
+
+void compress(inout uint cv[8], uint m[16], uint counter, uint block_len, uint flags) {
+    uint v[16];
+    [[unroll]] for (uint i = 0u; i < 8u; i++) {
+        v[i] = cv[i];
+    }
+    v[8] = IV[0]; v[9] = IV[1]; v[10] = IV[2]; v[11] = IV[3];
+    v[12] = counter; v[13] = 0u; v[14] = block_len; v[15] = flags;
+    [[unroll]] for (uint r = 0u; r < 7u; r++) {
+        G(0, 4, 8, 12, m[0], m[1]);
+        G(1, 5, 9, 13, m[2], m[3]);
+        G(2, 6, 10, 14, m[4], m[5]);
+        G(3, 7, 11, 15, m[6], m[7]);
+        G(0, 5, 10, 15, m[8], m[9]);
+        G(1, 6, 11, 12, m[10], m[11]);
+        G(2, 7, 8, 13, m[12], m[13]);
+        G(3, 4, 9, 14, m[14], m[15]);
+        if (r < 6u) {
+            const uint t[16] = uint[16](m[2], m[6], m[3], m[10], m[7], m[0], m[4], m[13],
+                                        m[1], m[11], m[12], m[5], m[9], m[14], m[15], m[8]);
+            m = t;
+        }
+    }
+    [[unroll]] for (uint i = 0u; i < 8u; i++) {
+        cv[i] = v[i] ^ v[i + 8u];
+    }
+}
+
+// Canonical word `w` of row `row`.
+uint word(uint row, uint w) {
+    const uint base = p.src_off + row * p.row_stride;
+    if ((p.kind & 0xFFu) == KIND_ROWS) {
+        return src[base + w];
+    }
+    const uint b = w / 9u;
+    if (b >= p.k_blocks) {
+        return 0u;
+    }
+    const uint wi = w - 9u * b;
+    // The rows were quantized as one flat array: block `b` of row `row` is block
+    // `row * k_blocks + b` of it, wherever the x4 groups fall.
+    const uint fb = row * p.k_blocks + b;
+    const uint g = p.src_off + (fb >> 2) * 36u;
+    const uint j = fb & 3u;
+    return wi == 0u ? src[g + j] : src[g + 4u + 8u * j + wi - 1u];
+}
+
+void main() {
+    const uint row = gl_WorkGroupID.x;
+    const uint tid = gl_LocalInvocationID.x;
+    const uint n_words = p.row_bytes / 4u;
+
+    if ((p.kind & COPY_MODE) != 0u) {
+        for (uint w = tid; w < n_words; w += 64u) {
+            cap[p.cap_off + w] = word(p.cap_row, w);
+        }
+        return;
+    }
+
+    const uint nch = (p.row_bytes + 1023u) / 1024u;
+    for (uint c = tid; c < nch; c += 64u) {
+        uint cv[8] = IV;
+        const uint len = min(1024u, p.row_bytes - c * 1024u);
+        const uint nblk = (len + 63u) / 64u;
+        for (uint b = 0u; b < nblk; b++) {
+            const uint blen = min(64u, len - b * 64u);
+            uint m[16];
+            [[unroll]] for (uint i = 0u; i < 16u; i++) {
+                m[i] = 4u * i < blen ? word(row, c * 256u + b * 16u + i) : 0u;
+            }
+            const bool last = b + 1u == nblk;
+            const uint flags = (b == 0u ? CHUNK_START : 0u) | (last ? CHUNK_END : 0u) | (last && nch == 1u ? ROOT : 0u);
+            compress(cv, m, c, blen, flags);
+        }
+        [[unroll]] for (uint i = 0u; i < 8u; i++) {
+            cvs[c * 8u + i] = cv[i];
+        }
+    }
+    barrier();
+
+    // Each level: every parent is computed into registers before any is written back over the
+    // pairs (an invocation folds at most MAX_CHUNKS / 2 / 64 = 8 of them), then an odd last node
+    // carries up.
+    uint n = nch;
+    while (n > 1u) {
+        const uint half_n = n / 2u;
+        uint outs[8][8];
+        [[unroll]] for (uint s = 0u; s < 8u; s++) {
+            const uint i = tid + 64u * s;
+            if (i < half_n) {
+                uint m[16];
+                [[unroll]] for (uint k = 0u; k < 8u; k++) {
+                    m[k] = cvs[(2u * i) * 8u + k];
+                    m[8u + k] = cvs[(2u * i + 1u) * 8u + k];
+                }
+                uint cv[8] = IV;
+                compress(cv, m, 0u, 64u, PARENT | (n == 2u ? ROOT : 0u));
+                outs[s] = cv;
+            }
+        }
+        barrier();
+        [[unroll]] for (uint s = 0u; s < 8u; s++) {
+            const uint i = tid + 64u * s;
+            if (i < half_n) {
+                [[unroll]] for (uint k = 0u; k < 8u; k++) {
+                    cvs[i * 8u + k] = outs[s][k];
+                }
+            }
+        }
+        if (tid == 0u && (n & 1u) != 0u) {
+            [[unroll]] for (uint k = 0u; k < 8u; k++) {
+                cvs[half_n * 8u + k] = cvs[(n - 1u) * 8u + k];
+            }
+        }
+        barrier();
+        n = half_n + (n & 1u);
+    }
+
+    if (tid == 0u) {
+        const uint pos = p.first_pos + row;
+        [[unroll]] for (uint k = 0u; k < 8u; k++) {
+            if (p.leaf_a != NO_LEAF) {
+                leaves[(pos * p.nl + p.leaf_a) * 8u + k] = cvs[k];
+            }
+            if (p.leaf_b != NO_LEAF) {
+                leaves[(pos * p.nl + p.leaf_b) * 8u + k] = cvs[k];
+            }
+        }
+    }
+}
