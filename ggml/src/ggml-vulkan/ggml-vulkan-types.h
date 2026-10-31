@@ -811,6 +811,8 @@ struct vk_device_struct {
     vk_pipeline pipeline_quantize_q8_1_x4;
     // Keryx canonical trace: BLAKE3 of captured rows (keryx_trace.comp).
     vk_pipeline pipeline_keryx_trace;
+    // Keryx canonical trace, attention rule: log softmax mass of flash-attention rows (keryx_lse.comp).
+    vk_pipeline pipeline_keryx_lse;
 
     vk_pipeline pipeline_dequant[GGML_TYPE_COUNT];
     vk_pipeline pipeline_dequant_transpose[GGML_TYPE_COUNT]; // fused dequant+transpose for FA quant-KV

@@ -875,6 +875,25 @@ struct vk_keryx_trace_push_constants {
     uint32_t cap_off;
 };
 
+// Must match the push constant block of keryx_lse.comp.
+struct vk_keryx_lse_push_constants {
+    uint32_t q_off;
+    uint32_t q_row;
+    uint32_t q_head;
+    uint32_t k_off;
+    uint32_t k_row;
+    uint32_t k_head;
+    uint32_t m_off;
+    uint32_t m_row;
+    uint32_t has_mask;
+    uint32_t n_kv;
+    uint32_t dim;
+    uint32_t gqa;
+    float    scale;
+    uint32_t o_off;
+    uint32_t o_row;
+};
+
 struct vk_op_flash_attn_split_k_reduce_push_constants {
     uint32_t D;
     uint32_t ne1;

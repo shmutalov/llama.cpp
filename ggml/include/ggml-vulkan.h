@@ -44,6 +44,15 @@ GGML_BACKEND_API int  ggml_backend_vk_keryx_trace_leaf_count(size_t dev_num);
 GGML_BACKEND_API int  ggml_backend_vk_keryx_trace_max_pos(size_t dev_num);
 GGML_BACKEND_API int  ggml_backend_vk_keryx_trace_begin(size_t dev_num);
 GGML_BACKEND_API int  ggml_backend_vk_keryx_trace_ubatch(size_t dev_num, uint32_t pos_base, uint32_t n_tokens);
+// _ubatch for a batch committed as part of a batch of `n_ubatch` tokens: its inputs take the q8_1
+// layout of that batch size (CUDA's MMQ layouts past 8) and the positions record `n_ubatch`.
+GGML_BACKEND_API int  ggml_backend_vk_keryx_trace_ubatch_as(size_t dev_num, uint32_t pos_base, uint32_t n_tokens, uint32_t n_ubatch);
+// Attention rule: capture the log softmax mass of every query head (up to `n_heads`) of the
+// flash-attention nodes of layers below `n_layers` at every traced position (0 layers: off).
+// Requires a configured trace; a later _configure drops it.
+GGML_BACKEND_API int  ggml_backend_vk_keryx_lse_configure(size_t dev_num, uint32_t n_layers, uint32_t n_heads);
+// The masses of positions [0, n_pos) of the last traced evaluation, [n_layers][n_pos][n_heads] f32.
+GGML_BACKEND_API int  ggml_backend_vk_keryx_lse_read(size_t dev_num, float * out, size_t out_cap, uint32_t n_pos);
 GGML_BACKEND_API int  ggml_backend_vk_keryx_trace_end(size_t dev_num);
 GGML_BACKEND_API int  ggml_backend_vk_keryx_trace_read(size_t dev_num, uint8_t * leaves, size_t leaves_cap, uint32_t * ubatch,
                                                        size_t ubatch_cap, uint32_t * n_pos);

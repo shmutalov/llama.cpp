@@ -7,7 +7,10 @@
 //   KIND_ROWS: the row's own words (f32 outputs and residuals);
 //   KIND_Q8:   a q8_1 activation row held as block_q8_1_x4 groups (4 x f16vec2 ds, then 128 int8),
 //              re-laid as 36-byte block_q8_1 (ds, 32 int8) blocks, zero blocks past `k_blocks` (the
-//              row is padded to a multiple of 512 values, as CUDA's MMVQ layout is).
+//              row is padded to a multiple of 512 values, as CUDA's MMVQ layout is);
+//   KIND_Q8_D4 / KIND_Q8_DS4: the same row in CUDA's MMQ layouts (block_q8_1_mmq: four f32
+//              scales, or four f16 (d, s) pairs, then 128 int8), as a prompt position committed
+//              in a batch of more than 8 tokens carries it.
 // One workgroup hashes one row: each invocation compresses whole 1 KiB chunks, then the chunk
 // chaining values are folded pairwise (an odd last node carries up), which is BLAKE3's tree.
 
@@ -35,6 +38,8 @@ layout(push_constant) uniform parameter {
 
 #define KIND_ROWS 0u
 #define KIND_Q8 1u
+#define KIND_Q8_D4 2u
+#define KIND_Q8_DS4 3u
 #define COPY_MODE 0x100u
 #define NO_LEAF 0xFFFFFFFFu
 #define MAX_CHUNKS 1024u
@@ -86,23 +91,40 @@ void compress(inout uint cv[8], uint m[16], uint counter, uint block_len, uint f
     }
 }
 
-// Canonical word `w` of row `row`.
-uint word(uint row, uint w) {
-    const uint base = p.src_off + row * p.row_stride;
-    if ((p.kind & 0xFFu) == KIND_ROWS) {
-        return src[base + w];
-    }
-    const uint b = w / 9u;
+// Word `wi` (0: the scale pair, 1..8: the values) of block `b` of q8_1 row `row`, read from the
+// x4 groups; zero past `k_blocks`.
+uint q8_word(uint row, uint b, uint wi) {
     if (b >= p.k_blocks) {
         return 0u;
     }
-    const uint wi = w - 9u * b;
     // The rows were quantized as one flat array: block `b` of row `row` is block
     // `row * k_blocks + b` of it, wherever the x4 groups fall.
     const uint fb = row * p.k_blocks + b;
     const uint g = p.src_off + (fb >> 2) * 36u;
     const uint j = fb & 3u;
     return wi == 0u ? src[g + j] : src[g + 4u + 8u * j + wi - 1u];
+}
+
+// Canonical word `w` of row `row`.
+uint word(uint row, uint w) {
+    const uint base = p.src_off + row * p.row_stride;
+    const uint kind = p.kind & 0xFFu;
+    if (kind == KIND_ROWS) {
+        return src[base + w];
+    }
+    if (kind == KIND_Q8_D4 || kind == KIND_Q8_DS4) {
+        // CUDA's MMQ layouts: 144-byte groups of four blocks, their four scales first (f32 d, or
+        // the f16 pair d and s), then the 128 values.
+        const uint gi = w / 36u;
+        const uint wi = w - 36u * gi;
+        if (wi < 4u) {
+            const uint ds = q8_word(row, 4u * gi + wi, 0u);
+            return kind == KIND_Q8_D4 ? floatBitsToUint(unpackHalf2x16(ds).x) : ds;
+        }
+        return q8_word(row, 4u * gi + (wi - 4u) / 8u, 1u + (wi - 4u) % 8u);
+    }
+    const uint b = w / 9u;
+    return q8_word(row, b, w - 9u * b);
 }
 
 void main() {

@@ -1,0 +1,112 @@
+#version 450
+
+// Keryx canonical trace (verifiable inference, attention rule): the log softmax mass of every
+// query row and head of a flash-attention node, log(sum_j exp(scale * q.k_j + mask_j)), over the
+// node's own inputs: the f32 queries, the q8_0 key cache view and the f16 mask. One workgroup per
+// (query row, head); each invocation folds a strided share of the keys into a running maximum and
+// sum, then the shares are merged.
+
+#extension GL_EXT_control_flow_attributes : require
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer Q { float q[]; };
+layout(binding = 1) readonly buffer K { uint k[]; };
+layout(binding = 2) readonly buffer M { uint m[]; };
+layout(binding = 3) writeonly buffer O { float o[]; };
+
+layout(push_constant) uniform parameter {
+    uint q_off;     // float offset of query row 0, head 0
+    uint q_row;     // floats between query rows
+    uint q_head;    // floats between query heads
+    uint k_off;     // byte offset of key 0, key head 0
+    uint k_row;     // bytes between keys
+    uint k_head;    // bytes between key heads
+    uint m_off;     // f16 offset of the mask row of query 0 (has_mask)
+    uint m_row;     // f16 values between mask rows
+    uint has_mask;
+    uint n_kv;
+    uint dim;       // head dimension, a multiple of 32
+    uint gqa;       // query heads per key head
+    float scale;
+    uint o_off;     // float offset of query row 0, head 0 in o
+    uint o_row;     // floats between query rows in o
+} p;
+
+shared float sh_max[64];
+shared float sh_sum[64];
+
+uint byte_at(uint off) {
+    return (k[off >> 2] >> ((off & 3u) * 8u)) & 0xFFu;
+}
+
+float key_dot(uint row, uint h) {
+    const uint qb = p.q_off + gl_WorkGroupID.x * p.q_row + h * p.q_head;
+    const uint kb = p.k_off + row * p.k_row + (h / p.gqa) * p.k_head;
+    float acc = 0.0;
+    for (uint b = 0u; b < p.dim / 32u; b++) {
+        const uint bo = kb + 34u * b;
+        const float d = unpackHalf2x16(byte_at(bo) | (byte_at(bo + 1u) << 8u)).x;
+        float s = 0.0;
+        for (uint i = 0u; i < 32u; i++) {
+            const int v = int(byte_at(bo + 2u + i) << 24u) >> 24;
+            s += q[qb + 32u * b + i] * float(v);
+        }
+        acc += d * s;
+    }
+    return acc;
+}
+
+float mask_at(uint j) {
+    if (p.has_mask == 0u) {
+        return 0.0;
+    }
+    const uint e = p.m_off + gl_WorkGroupID.x * p.m_row + j;
+    const vec2 pair = unpackHalf2x16(m[e >> 1]);
+    return (e & 1u) == 0u ? pair.x : pair.y;
+}
+
+void main() {
+    const uint h = gl_WorkGroupID.y;
+    const uint tid = gl_LocalInvocationID.x;
+    const float NEG_INF = uintBitsToFloat(0xFF800000u);
+
+    float mx = NEG_INF;
+    float sum = 0.0;
+    for (uint j = tid; j < p.n_kv; j += 64u) {
+        const float mk = mask_at(j);
+        if (isinf(mk) && mk < 0.0) {
+            continue;
+        }
+        const float s = p.scale * key_dot(j, h) + mk;
+        if (s > mx) {
+            sum = sum * exp(mx - s) + 1.0;
+            mx = s;
+        } else {
+            sum += exp(s - mx);
+        }
+    }
+    sh_max[tid] = mx;
+    sh_sum[tid] = sum;
+    barrier();
+    for (uint w = 32u; w > 0u; w >>= 1u) {
+        if (tid < w) {
+            const float m0 = sh_max[tid], m1 = sh_max[tid + w];
+            const float s0 = sh_sum[tid], s1 = sh_sum[tid + w];
+            const float mm = max(m0, m1);
+            float s = 0.0;
+            if (s0 > 0.0) {
+                s += s0 * exp(m0 - mm);
+            }
+            if (s1 > 0.0) {
+                s += s1 * exp(m1 - mm);
+            }
+            sh_max[tid] = mm;
+            sh_sum[tid] = s;
+        }
+        barrier();
+    }
+    if (tid == 0u) {
+        o[p.o_off + gl_WorkGroupID.x * p.o_row + h] = sh_sum[0] > 0.0 ? sh_max[0] + log(sh_sum[0]) : NEG_INF;
+    }
+}

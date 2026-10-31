@@ -272,6 +272,7 @@ struct vk_keryx_product {
     int  form;   // 0 none, 1 split GLU, 2 GLU gate, 3 GLU up
     int  bias;   // manifest index of the bias, -1 none
     bool head;   // ROLE_OUTPUT: rows only at the output positions
+    uint32_t wtype;  // ggml type of the weights: picks the MMQ layout of a batched input
 };
 
 struct vk_keryx_trace {
@@ -282,7 +283,16 @@ struct vk_keryx_trace {
     uint32_t n_products = 0, n_layers = 0, n_router = 0, nl = 0;
     uint32_t max_pos = 0;
     uint32_t pos_base = 0, n_tokens = 0, n_pos = 0;
+    // Batch size the current batch is committed as (its inputs' q8_1 layout and the meta leaf):
+    // the evaluation feeds at most 8 tokens at a time, a prompt is committed in batches of up to
+    // 512 (CUDA's MMQ layouts past 8).
+    uint32_t declared = 0;
     std::vector<uint32_t> ubatch;
+    // Attention rule: the log softmax mass of every query head of every attention layer at every
+    // position, [lse_layers][max_pos][lse_heads] f32, written by `keryx_lse.comp` after each
+    // flash-attention node while armed.
+    vk_buffer lse;
+    uint32_t lse_layers = 0, lse_heads = 0;
     vk_buffer leaves;    // host-visible, [max_pos][nl][8] u32
     vk_buffer caps;      // host-visible capture slots
     std::vector<std::pair<uint32_t, uint32_t>> cap_list;  // armed (position, leaf)
@@ -3288,6 +3298,8 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
     // One workgroup per row.
     ggml_vk_create_pipeline(device, device->pipeline_keryx_trace, "keryx_trace", keryx_trace_len, keryx_trace_data, "main", 3, sizeof(vk_keryx_trace_push_constants), {1, 1, 1}, {}, 1);
+    // One workgroup per (query row, head).
+    ggml_vk_create_pipeline(device, device->pipeline_keryx_lse, "keryx_lse", keryx_lse_len, keryx_lse_data, "main", 4, sizeof(vk_keryx_lse_push_constants), {1, 1, 1}, {}, 1);
 
     for (uint32_t i = 0; i < p021_max_gqa_ratio; ++i) {
         if (device->subgroup_arithmetic && device->subgroup_require_full_support) {
@@ -12230,6 +12242,8 @@ void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_context subct
 static constexpr uint32_t VK_KERYX_NO_LEAF = 0xFFFFFFFFu;
 static constexpr uint32_t VK_KERYX_KIND_ROWS = 0;
 static constexpr uint32_t VK_KERYX_KIND_Q8 = 1;
+static constexpr uint32_t VK_KERYX_KIND_Q8_D4 = 2;
+static constexpr uint32_t VK_KERYX_KIND_Q8_DS4 = 3;
 static constexpr uint32_t VK_KERYX_COPY = 0x100;
 // keryx_trace.comp folds at most 1024 chunks of 1 KiB per row.
 static constexpr uint64_t VK_KERYX_MAX_ROW_BYTES = 1024 * 1024;
@@ -12351,6 +12365,68 @@ static int ggml_vk_keryx_resid_leaf(const vk_keryx_trace & t, const char * name)
     return -1;
 }
 
+// Layer index of a node named `<kind>-<layer>` whose kind is `kind`, or -1.
+static int ggml_vk_keryx_layer_of(const char * name, const char * kind) {
+    const char * dash = strrchr(name, '-');
+    const size_t n = strlen(kind);
+    if (!dash || (size_t) (dash - name) != n || strncmp(name, kind, n) != 0 || dash[1] < '0' || dash[1] > '9') {
+        return -1;
+    }
+    char * end = nullptr;
+    const unsigned long il = strtoul(dash + 1, &end, 10);
+    return *end == '\0' && il < 0x10000 ? (int) il : -1;
+}
+
+// The log softmax mass of every query row and head of the flash-attention node `node` of layer
+// `il`, into the mass buffer at the batch's positions.
+static void ggml_vk_keryx_lse(ggml_backend_vk_context * ctx, vk_context & subctx, vk_keryx_trace & t, const ggml_tensor * node, uint32_t il) {
+    const ggml_tensor * q = node->src[0];
+    const ggml_tensor * k = node->src[1];
+    const ggml_tensor * mask = node->src[3];
+    float scale, max_bias, softcap;
+    memcpy(&scale, (const float *) node->op_params + 0, sizeof(float));
+    memcpy(&max_bias, (const float *) node->op_params + 1, sizeof(float));
+    memcpy(&softcap, (const float *) node->op_params + 2, sizeof(float));
+    if (il >= t.lse_layers) {
+        ggml_vk_keryx_fail(t, "attention layer " + std::to_string(il) + " past the mass capture");
+        return;
+    }
+    if (q->type != GGML_TYPE_F32 || k->type != GGML_TYPE_Q8_0 || (mask && mask->type != GGML_TYPE_F16) || max_bias != 0.0f || softcap != 0.0f ||
+        q->ne[3] != 1 || k->ne[3] != 1 || q->ne[0] != k->ne[0] || q->ne[0] % 32 != 0 || q->nb[0] != 4 || k->ne[2] == 0 || q->ne[2] % k->ne[2] != 0 ||
+        (uint64_t) q->ne[2] > t.lse_heads || node->src[4] != nullptr) {
+        ggml_vk_keryx_fail(t, std::string("unsupported attention node ") + node->name + " for the mass capture");
+        return;
+    }
+    const uint64_t n_q = (uint64_t) q->ne[1];
+    if (n_q != t.n_tokens || t.pos_base + n_q > t.max_pos) {
+        ggml_vk_keryx_fail(t, std::string("attention node ") + node->name + " does not cover the batch");
+        return;
+    }
+    const vk_subbuffer qb = ggml_vk_tensor_subbuffer(ctx, q, true);
+    const vk_subbuffer kb = ggml_vk_tensor_subbuffer(ctx, k, true);
+    const vk_subbuffer mb = mask ? ggml_vk_tensor_subbuffer(ctx, mask, true) : qb;
+    const uint64_t q_mis = ggml_vk_tensor_buffer_offset(ctx, q) - qb.offset;
+    const uint64_t k_mis = ggml_vk_tensor_buffer_offset(ctx, k) - kb.offset;
+    const uint64_t m_mis = mask ? ggml_vk_tensor_buffer_offset(ctx, mask) - mb.offset : 0;
+    if (q_mis % 4 != 0 || q->nb[1] % 4 != 0 || q->nb[2] % 4 != 0 || m_mis % 2 != 0 || (mask && mask->nb[1] % 2 != 0)) {
+        ggml_vk_keryx_fail(t, std::string("misaligned attention node ") + node->name + " for the mass capture");
+        return;
+    }
+    vk_pipeline & pipe = ctx->device->pipeline_keryx_lse;
+    const vk_subbuffer out = { t.lse, 0, t.lse->size };
+    ggml_pipeline_request_descriptor_sets(ctx, pipe, 1);
+    ggml_vk_sync_buffers(ctx, subctx);
+    vk_keryx_lse_push_constants pc = {
+        (uint32_t) (q_mis / 4), (uint32_t) (q->nb[1] / 4), (uint32_t) (q->nb[2] / 4),
+        (uint32_t) k_mis, (uint32_t) k->nb[1], (uint32_t) k->nb[2],
+        (uint32_t) (m_mis / 2), mask ? (uint32_t) (mask->nb[1] / 2) : 0u, mask ? 1u : 0u,
+        (uint32_t) k->ne[1], (uint32_t) q->ne[0], (uint32_t) (q->ne[2] / k->ne[2]), scale,
+        (uint32_t) (((uint64_t) il * t.max_pos + t.pos_base) * t.lse_heads), t.lse_heads,
+    };
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipe, { qb, kb, mb, out }, pc, { (uint32_t) n_q, (uint32_t) q->ne[2], 1 });
+    ggml_vk_sync_buffers(ctx, subctx);
+}
+
 // After `node`'s own dispatch: the leaves it carries. A product matmul carries its q8_1 input rows
 // (and its output rows when the product is plain); the GLU of a gated pair or split product, or
 // the bias add of a biased one, carries that product's output; a residual node carries its rows.
@@ -12371,7 +12447,16 @@ static void ggml_vk_keryx_on_node(ggml_backend_vk_context * ctx, vk_context & su
             const uint64_t kp = (k + 511) / 512 * 512;
             const uint64_t first = p.head ? ggml_vk_keryx_first_pos(t, rows) : t.pos_base;
             const vk_subbuffer y = { ctx->prealloc_y, 0, ctx->prealloc_y->size };
-            ggml_vk_keryx_rows(ctx, subctx, t, y, 0, 0, kp / 32 * 36, VK_KERYX_KIND_Q8, (uint32_t) (k / 32), rows, first, 2 * r, -1,
+            // The layout the committed batch size gives the input (the verifier's `input_layout`):
+            // MMVQ up to 8 tokens and for the head, else CUDA's MMQ layout of the weight type. The
+            // values are the same q8_1 blocks; the row is as long in every layout.
+            uint32_t kind = VK_KERYX_KIND_Q8;
+            if (!p.head && t.declared > 8) {
+                const bool ds4 = p.wtype == GGML_TYPE_Q4_0 || p.wtype == GGML_TYPE_Q4_1 || p.wtype == GGML_TYPE_Q5_1 ||
+                                 p.wtype == GGML_TYPE_Q4_K || p.wtype == GGML_TYPE_Q5_K;
+                kind = ds4 ? VK_KERYX_KIND_Q8_DS4 : VK_KERYX_KIND_Q8_D4;
+            }
+            ggml_vk_keryx_rows(ctx, subctx, t, y, 0, 0, kp / 32 * 36, kind, (uint32_t) (k / 32), rows, first, 2 * r, -1,
                                node->src[0]->name);
             if (p.form == 0 && p.bias < 0) {
                 ggml_vk_keryx_tensor_rows(ctx, subctx, t, node, 2 * r + 1, p.head ? ggml_vk_keryx_first_pos(t, ggml_nrows(node)) : t.pos_base);
@@ -12397,6 +12482,14 @@ static void ggml_vk_keryx_on_node(ggml_backend_vk_context * ctx, vk_context & su
         if (r >= 0 && t.prod[r].form == 0 && t.prod[r].bias >= 0 && l > 5 && strcmp(bn + l - 5, ".bias") == 0) {
             ggml_vk_keryx_tensor_rows(ctx, subctx, t, node, 2 * r + 1, t.prod[r].head ? ggml_vk_keryx_first_pos(t, ggml_nrows(node)) : t.pos_base);
         }
+    }
+    if (node->op == GGML_OP_FLASH_ATTN_EXT && t.lse) {
+        const int il = ggml_vk_keryx_layer_of(node->name, "__fattn__");
+        if (il < 0) {
+            ggml_vk_keryx_fail(t, std::string("attention node ") + node->name + " names no layer");
+            return;
+        }
+        ggml_vk_keryx_lse(ctx, subctx, t, node, (uint32_t) il);
     }
     const int leaf = ggml_vk_keryx_resid_leaf(t, node->name);
     if (leaf >= 0) {
@@ -15509,19 +15602,21 @@ static bool ggml_vk_keryx_load_manifest(vk_keryx_trace & s, const uint8_t * b, s
         std::string name((const char *) &b[o + 2], nl);
         const uint8_t * r = &b[o + 2 + nl];
         const uint8_t role = r[44], form = r[46];
-        uint32_t bias;
+        uint32_t bias, wtype;
         memcpy(&bias, &r[51], 4);
+        memcpy(&wtype, &r[0], 4);
         if (i < n_products) {
             s.rank[name] = (int) i;
-            s.prod.push_back({ form, bias == 0xFFFFFFFFu ? -1 : (int) bias, role == 2 });
+            s.prod.push_back({ form, bias == 0xFFFFFFFFu ? -1 : (int) bias, role == 2, wtype });
         }
         o += 2 + nl + 55;
         if (chain) {
             if (o >= len) {
                 return false;
             }
+            // Layer tags: 2 plain, 3 routed, 4/5 with attention (21 fields), 6/7 recurrent (19 fields).
             const uint8_t tag = b[o];
-            const size_t ext = tag == 0 ? 1 : tag == 1 ? 14 : tag == 2 ? 25 : tag == 3 ? 49 : 0;
+            const size_t ext = tag == 0 ? 1 : tag == 1 ? 14 : tag == 2 ? 25 : tag == 3 ? 49 : tag == 4 ? 25 + 84 : tag == 5 ? 49 + 84 : tag == 6 ? 25 + 76 : tag == 7 ? 49 + 76 : 0;
             if (ext == 0 || o + ext > len) {
                 return false;
             }
@@ -15532,7 +15627,7 @@ static bool ggml_vk_keryx_load_manifest(vk_keryx_trace & s, const uint8_t * b, s
                     return false;
                 }
                 n_layers++;
-                moe = moe || tag == 3;
+                moe = moe || tag == 3 || tag == 5 || tag == 7;
             }
             o += ext;
         }
@@ -15615,6 +15710,11 @@ int ggml_backend_vk_keryx_trace_begin(size_t dev_num) {
     memset(t.leaves->ptr, 0, t.leaves->size);
     t.ubatch.assign(t.max_pos, 0);
     t.pos_base = t.n_tokens = t.n_pos = 0;
+    t.declared = 0;
+    if (t.lse) {
+        // An unwritten mass reads back as NaN, never as a value.
+        std::fill_n((float *) t.lse->ptr, t.lse->size / 4, std::numeric_limits<float>::quiet_NaN());
+    }
     t.cap_list.clear();
     t.cap_len.clear();
     t.cap_slot = 0;
@@ -15624,13 +15724,17 @@ int ggml_backend_vk_keryx_trace_begin(size_t dev_num) {
 }
 
 int ggml_backend_vk_keryx_trace_ubatch(size_t dev_num, uint32_t pos_base, uint32_t n_tokens) {
+    return ggml_backend_vk_keryx_trace_ubatch_as(dev_num, pos_base, n_tokens, n_tokens);
+}
+
+int ggml_backend_vk_keryx_trace_ubatch_as(size_t dev_num, uint32_t pos_base, uint32_t n_tokens, uint32_t n_ubatch) {
     vk_device dev = ggml_vk_keryx_device(dev_num);
     if (!dev) {
         return -1;
     }
     std::lock_guard<std::mutex> g(vk_keryx_mutex);
     vk_keryx_trace & t = vk_keryx_traces[dev->idx];
-    if (!t.armed || n_tokens == 0) {
+    if (!t.armed || n_tokens == 0 || n_ubatch < n_tokens) {
         return -1;
     }
     if ((uint64_t) pos_base + n_tokens > t.max_pos) {
@@ -15639,8 +15743,9 @@ int ggml_backend_vk_keryx_trace_ubatch(size_t dev_num, uint32_t pos_base, uint32
     }
     t.pos_base = pos_base;
     t.n_tokens = n_tokens;
+    t.declared = n_ubatch;
     for (uint32_t p = pos_base; p < pos_base + n_tokens; ++p) {
-        t.ubatch[p] = n_tokens;
+        t.ubatch[p] = n_ubatch;
     }
     t.n_pos = std::max(t.n_pos, pos_base + n_tokens);
     return 0;
@@ -15748,6 +15853,64 @@ int ggml_backend_vk_keryx_trace_read_captures(size_t dev_num, uint8_t * out, siz
     t.cap_list.clear();
     t.cap_len.clear();
     return rc;
+}
+
+int ggml_backend_vk_keryx_lse_configure(size_t dev_num, uint32_t n_layers, uint32_t n_heads) {
+    vk_device dev = ggml_vk_keryx_device(dev_num);
+    if (!dev) {
+        return -1;
+    }
+    std::lock_guard<std::mutex> g(vk_keryx_mutex);
+    vk_keryx_trace & t = vk_keryx_traces[dev->idx];
+    if (!t.on || t.armed) {
+        return -1;
+    }
+    if (n_layers == 0 || n_heads == 0) {
+        t.lse.reset();
+        t.lse_layers = t.lse_heads = 0;
+        return 0;
+    }
+    if (t.lse && t.lse_layers == n_layers && t.lse_heads == n_heads) {
+        return 0;
+    }
+    t.lse.reset();
+    t.lse_layers = t.lse_heads = 0;
+    try {
+        t.lse = ggml_vk_keryx_host_buffer(dev, (size_t) n_layers * t.max_pos * n_heads * 4);
+    } catch (const std::exception &) {
+        t.lse.reset();
+        return -3;
+    }
+    if (!t.lse || !t.lse->ptr) {
+        t.lse.reset();
+        return -3;
+    }
+    t.lse_layers = n_layers;
+    t.lse_heads = n_heads;
+    return 0;
+}
+
+int ggml_backend_vk_keryx_lse_read(size_t dev_num, float * out, size_t out_cap, uint32_t n_pos) {
+    vk_device dev = ggml_vk_keryx_device(dev_num);
+    if (!dev || !out) {
+        return -1;
+    }
+    std::lock_guard<std::mutex> g(vk_keryx_mutex);
+    const vk_keryx_trace & t = vk_keryx_traces[dev->idx];
+    if (!t.on || !t.lse || t.armed || n_pos > t.max_pos) {
+        return -1;
+    }
+    if (!t.error.empty()) {
+        return -9;
+    }
+    const size_t row = (size_t) n_pos * t.lse_heads;
+    if (out_cap < (size_t) t.lse_layers * row) {
+        return -6;
+    }
+    for (uint32_t l = 0; l < t.lse_layers; ++l) {
+        memcpy(out + l * row, (const float *) t.lse->ptr + (size_t) l * t.max_pos * t.lse_heads, row * 4);
+    }
+    return 0;
 }
 
 const char * ggml_backend_vk_keryx_trace_error(size_t dev_num) {
