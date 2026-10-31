@@ -813,6 +813,8 @@ struct vk_device_struct {
     vk_pipeline pipeline_keryx_trace;
     // Keryx canonical trace, attention rule: log softmax mass of flash-attention rows (keryx_lse.comp).
     vk_pipeline pipeline_keryx_lse;
+    // Keryx canonical trace, attention rule: delta-rule records of gated-delta-net heads (keryx_rec.comp).
+    vk_pipeline pipeline_keryx_rec;
 
     vk_pipeline pipeline_dequant[GGML_TYPE_COUNT];
     vk_pipeline pipeline_dequant_transpose[GGML_TYPE_COUNT]; // fused dequant+transpose for FA quant-KV
@@ -1123,6 +1125,10 @@ typedef std::vector<vk_submission> vk_sequence;
 #define MAT_VEC_FUSION_FLAGS_SCALE0 0x4
 
 #define MAT_VEC_FUSION_FLAGS_SCALE1 0x8
+
+// Keryx canonical trace: CUDA's MMQ arithmetic for a Q4_K/Q5_K product of a batch committed past 8
+// tokens (mul_mat_vecq_funcs.glsl).
+#define MAT_VEC_FUSION_FLAGS_KERYX_DS4 0x10
 
 struct vk_staging_memcpy {
     vk_staging_memcpy(void * _dst, const void * _src, size_t _n) : dst(_dst), src(_src), n(_n) {}

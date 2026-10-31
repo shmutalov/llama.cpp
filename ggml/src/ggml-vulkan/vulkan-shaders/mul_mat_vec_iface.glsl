@@ -4,6 +4,9 @@
 #define MAT_VEC_FUSION_FLAGS_BIAS1 0x2
 #define MAT_VEC_FUSION_FLAGS_SCALE0 0x4
 #define MAT_VEC_FUSION_FLAGS_SCALE1 0x8
+// Keryx canonical trace: a product committed in a batch past 8 tokens takes CUDA's MMQ arithmetic
+// (Q4_K/Q5_K: f16 tile scales, the min term on the stored block sums), as the verifier recomputes it.
+#define MAT_VEC_FUSION_FLAGS_KERYX_DS4 0x10
 
 layout (binding = 0) readonly buffer A {A_TYPE data_a[];};
 #if defined(A_TYPEV4)

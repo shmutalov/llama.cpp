@@ -946,6 +946,7 @@ void process_shaders() {
     // Keryx canonical trace (verifiable inference): BLAKE3 of captured rows.
     string_to_spv("keryx_trace", "keryx_trace.comp", {});
     string_to_spv("keryx_lse", "keryx_lse.comp", {});
+    string_to_spv("keryx_rec", "keryx_rec.comp", {});
 
     string_to_spv("mul_f32", "mul.comp", {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
 

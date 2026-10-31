@@ -47,6 +47,17 @@ GGML_BACKEND_API int  ggml_backend_vk_keryx_trace_ubatch(size_t dev_num, uint32_
 // _ubatch for a batch committed as part of a batch of `n_ubatch` tokens: its inputs take the q8_1
 // layout of that batch size (CUDA's MMQ layouts past 8) and the positions record `n_ubatch`.
 GGML_BACKEND_API int  ggml_backend_vk_keryx_trace_ubatch_as(size_t dev_num, uint32_t pos_base, uint32_t n_tokens, uint32_t n_ubatch);
+// Attention rule, recurrent layers: `layers` holds `n` rows of (layer, kind, slot, heads, head_dim)
+// (kind 3 = one decay per head, 4 = one per key dimension; every row the same heads and dimension),
+// checkpointed every `interval` positions; n = 0 turns the capture off. Every traced batch then
+// records the delta rule of each head of each fused gated-delta-net node. Requires a configured
+// trace; a later _configure drops it.
+GGML_BACKEND_API int  ggml_backend_vk_keryx_recur_configure(size_t dev_num, const uint32_t * layers, uint32_t n, uint32_t interval);
+// After a traced batch's decode (waits for the device): the records of the batch, [slot][head][token]
+// of `8 * head_dim + 4 + (4 | 2 * head_dim)` bytes each, and when the batch ends a checkpoint interval
+// (`*has_ckpt`) the state of every head after it, [slot][head][head_dim * head_dim] f32.
+GGML_BACKEND_API int  ggml_backend_vk_keryx_recur_read(size_t dev_num, uint8_t * rec, size_t rec_cap, uint8_t * ckpt, size_t ckpt_cap,
+                                                      uint32_t * n_tokens, uint32_t * has_ckpt);
 // Attention rule: capture the log softmax mass of every query head (up to `n_heads`) of the
 // flash-attention nodes of layers below `n_layers` at every traced position (0 layers: off).
 // Requires a configured trace; a later _configure drops it.

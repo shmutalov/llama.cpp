@@ -875,6 +875,29 @@ struct vk_keryx_trace_push_constants {
     uint32_t cap_off;
 };
 
+// Must match the push constant block of keryx_rec.comp.
+struct vk_keryx_rec_push_constants {
+    uint32_t q_off;
+    uint32_t k_off;
+    uint32_t v_off;
+    uint32_t g_off;
+    uint32_t b_off;
+    uint32_t o_off;
+    uint32_t sq1;
+    uint32_t sq2;
+    uint32_t sv1;
+    uint32_t sv2;
+    uint32_t sb1;
+    uint32_t sb2;
+    uint32_t H;
+    uint32_t H_k;
+    uint32_t S;
+    uint32_t kda;
+    uint32_t rec_words;
+    uint32_t out_off;
+    uint32_t t_stride;
+};
+
 // Must match the push constant block of keryx_lse.comp.
 struct vk_keryx_lse_push_constants {
     uint32_t q_off;

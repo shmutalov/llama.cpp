@@ -1,0 +1,71 @@
+#version 450
+
+// Keryx canonical trace (verifiable inference, attention rule): the delta-rule record of every
+// head of a fused gated-delta-net node at every token of the batch, from the node's own inputs and
+// output: q, k, v and the output o (before the gated norm) as f16, beta as f32, then the log decay g
+// as f32 (one per head) or f16 (one per key dimension, KDA). The node reads query/key head
+// `h % H_k` for value head `h`, and its g shares beta's strides. One workgroup per (head, token);
+// record `(h, t)` lands at word `out_off + (h * t_stride + t) * rec_words`.
+
+#extension GL_EXT_control_flow_attributes : require
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer Q { float q[]; };
+layout(binding = 1) readonly buffer K { float k[]; };
+layout(binding = 2) readonly buffer V { float v[]; };
+layout(binding = 3) readonly buffer G { float g[]; };
+layout(binding = 4) readonly buffer B { float beta[]; };
+layout(binding = 5) readonly buffer O { float o[]; };
+layout(binding = 6) writeonly buffer R { uint r[]; };
+
+layout(push_constant) uniform parameter {
+    uint q_off;     // float offsets of the first element of each binding's tensor
+    uint k_off;
+    uint v_off;
+    uint g_off;
+    uint b_off;
+    uint o_off;
+    uint sq1;       // floats between query/key heads
+    uint sq2;       // floats between query/key tokens
+    uint sv1;       // floats between value heads
+    uint sv2;       // floats between value tokens
+    uint sb1;       // floats between beta/g heads
+    uint sb2;       // floats between beta/g tokens
+    uint H;         // value heads
+    uint H_k;       // query/key heads
+    uint S;         // head dimension (even)
+    uint kda;
+    uint rec_words;
+    uint out_off;
+    uint t_stride;
+} p;
+
+void main() {
+    const uint h = gl_WorkGroupID.x;
+    const uint t = gl_WorkGroupID.y;
+    const uint hk = h % p.H_k;
+    const uint qb = p.q_off + t * p.sq2 + hk * p.sq1;
+    const uint kb = p.k_off + t * p.sq2 + hk * p.sq1;
+    const uint vb = p.v_off + t * p.sv2 + h * p.sv1;
+    const uint ob = p.o_off + (t * p.H + h) * p.S;
+    const uint gb = t * p.sb2 + h * p.sb1;
+    const uint base = p.out_off + (h * p.t_stride + t) * p.rec_words;
+    const uint half_s = p.S / 2;
+    for (uint i = gl_LocalInvocationID.x; i < half_s; i += 64) {
+        r[base + i]              = packHalf2x16(vec2(q[qb + 2 * i], q[qb + 2 * i + 1]));
+        r[base + half_s + i]     = packHalf2x16(vec2(k[kb + 2 * i], k[kb + 2 * i + 1]));
+        r[base + 2 * half_s + i] = packHalf2x16(vec2(v[vb + 2 * i], v[vb + 2 * i + 1]));
+        r[base + 3 * half_s + i] = packHalf2x16(vec2(o[ob + 2 * i], o[ob + 2 * i + 1]));
+        if (p.kda != 0) {
+            const uint gi = p.g_off + gb * p.S + 2 * i;
+            r[base + 2 * p.S + 1 + i] = packHalf2x16(vec2(g[gi], g[gi + 1]));
+        }
+    }
+    if (gl_LocalInvocationID.x == 0) {
+        r[base + 2 * p.S] = floatBitsToUint(beta[p.b_off + gb]);
+        if (p.kda == 0) {
+            r[base + 2 * p.S + 1] = floatBitsToUint(g[p.g_off + gb]);
+        }
+    }
+}

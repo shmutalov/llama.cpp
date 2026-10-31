@@ -400,6 +400,8 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
 
     // K=1: output carries the final state only. state s is 4D [S_v, S_v, H_v, n_seqs].
     ggml_tensor * result = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, /*K=*/1);
+    // Keryx canonical trace: the backend records the delta rule of a node named after its layer.
+    ggml_format_name(result, "__gdn__-%d", il);
     if (n_tokens == 1) {
         res->add_fused_node({LLM_FUSED_OP_GDN_AR, result, il});
     } else {

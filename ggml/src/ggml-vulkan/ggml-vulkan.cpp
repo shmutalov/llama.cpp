@@ -293,6 +293,16 @@ struct vk_keryx_trace {
     // flash-attention node while armed.
     vk_buffer lse;
     uint32_t lse_layers = 0, lse_heads = 0;
+    // Attention rule, recurrent layers: per batch, the delta-rule record of every head of every
+    // recurrent layer at every token, [slot][head][VK_KERYX_REC_TOKENS][rec_bytes], written by
+    // `keryx_rec.comp` after each fused gated-delta-net node; and when the batch ends a checkpoint
+    // interval, the state of every head after it, [slot][head][dim * dim] f32. The miner reads both
+    // back after every batch (`ggml_backend_vk_keryx_recur_read`).
+    vk_buffer rec, rec_ckpt;
+    std::vector<int> rec_slot;        // by layer: its recurrent slot, -1 none
+    std::vector<uint8_t> rec_seen;    // by slot: recorded in the current batch
+    uint32_t rec_n = 0, rec_heads = 0, rec_dim = 0, rec_kda = 0, rec_bytes = 0, rec_interval = 0;
+    bool rec_ckpt_due = false;        // the current batch ends a checkpoint interval
     vk_buffer leaves;    // host-visible, [max_pos][nl][8] u32
     vk_buffer caps;      // host-visible capture slots
     std::vector<std::pair<uint32_t, uint32_t>> cap_list;  // armed (position, leaf)
@@ -306,6 +316,7 @@ static vk_keryx_trace * const vk_keryx_traces = new vk_keryx_trace[GGML_VK_MAX_D
 static std::mutex vk_keryx_mutex;
 
 static bool ggml_vk_keryx_armed(const vk_device & device);
+static bool ggml_vk_keryx_mmq_tiles(const vk_device & device, const ggml_tensor * w);
 
 void * const vk_ptr_base = (void *)(uintptr_t) 0x1000;  // NOLINT
 
@@ -3300,6 +3311,8 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_keryx_trace, "keryx_trace", keryx_trace_len, keryx_trace_data, "main", 3, sizeof(vk_keryx_trace_push_constants), {1, 1, 1}, {}, 1);
     // One workgroup per (query row, head).
     ggml_vk_create_pipeline(device, device->pipeline_keryx_lse, "keryx_lse", keryx_lse_len, keryx_lse_data, "main", 4, sizeof(vk_keryx_lse_push_constants), {1, 1, 1}, {}, 1);
+    // One workgroup per (head, token).
+    ggml_vk_create_pipeline(device, device->pipeline_keryx_rec, "keryx_rec", keryx_rec_len, keryx_rec_data, "main", 7, sizeof(vk_keryx_rec_push_constants), {1, 1, 1}, {}, 1);
 
     for (uint32_t i = 0; i < p021_max_gqa_ratio; ++i) {
         if (device->subgroup_arithmetic && device->subgroup_require_full_support) {
@@ -6884,6 +6897,9 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
     }
 
     uint32_t fusion_flags = 0;
+    if (quantize_y && ggml_vk_keryx_mmq_tiles(ctx->device, src0)) {
+        fusion_flags |= MAT_VEC_FUSION_FLAGS_KERYX_DS4;
+    }
 
     vk_subbuffer d_F0 = d_D;
     if (ctx->num_additional_fused_ops > 0) {
@@ -12339,6 +12355,18 @@ static int ggml_vk_keryx_rank(const vk_keryx_trace & t, const ggml_tensor * w) {
     return it == t.rank.end() ? -1 : it->second;
 }
 
+// Whether the product of weight `w` takes CUDA's MMQ tile arithmetic (MAT_VEC_FUSION_FLAGS_KERYX_DS4):
+// the batch is committed past 8 tokens, the weight is Q4_K/Q5_K, and the product is not the head,
+// whose input the verifier always reads in the MMVQ layout.
+static bool ggml_vk_keryx_mmq_tiles(const vk_device & device, const ggml_tensor * w) {
+    if (!ggml_vk_keryx_armed(device) || !w || (w->type != GGML_TYPE_Q4_K && w->type != GGML_TYPE_Q5_K)) {
+        return false;
+    }
+    const vk_keryx_trace & t = vk_keryx_traces[device->idx];
+    const int r = ggml_vk_keryx_rank(t, w);
+    return t.declared > 8 && r >= 0 && !t.prod[r].head;
+}
+
 // Residual leaf of a layer-stream node named `<kind>-<layer>`, or -1.
 static int ggml_vk_keryx_resid_leaf(const vk_keryx_trace & t, const char * name) {
     const char * dash = strrchr(name, '-');
@@ -12427,6 +12455,67 @@ static void ggml_vk_keryx_lse(ggml_backend_vk_context * ctx, vk_context & subctx
     ggml_vk_sync_buffers(ctx, subctx);
 }
 
+// Tokens a recorded batch holds at most (the miner's traced batch).
+static constexpr uint32_t VK_KERYX_REC_TOKENS = 8;
+
+// The record of every head of the fused gated-delta-net node `node` of layer `il` at every token of
+// the batch, and, when the batch ends a checkpoint interval, the state the node leaves behind.
+static void ggml_vk_keryx_recur(ggml_backend_vk_context * ctx, vk_context & subctx, vk_keryx_trace & t, const ggml_tensor * node, uint32_t il) {
+    const int slot = il < t.rec_slot.size() ? t.rec_slot[il] : -1;
+    if (slot < 0) {
+        ggml_vk_keryx_fail(t, std::string("recurrent node ") + node->name + " of no recurrent layer");
+        return;
+    }
+    const ggml_tensor * q = node->src[0];
+    const ggml_tensor * k = node->src[1];
+    const ggml_tensor * v = node->src[2];
+    const ggml_tensor * g = node->src[3];
+    const ggml_tensor * b = node->src[4];
+    const uint32_t S = (uint32_t) v->ne[0], H = (uint32_t) v->ne[1], n_tokens = (uint32_t) v->ne[2], H_k = (uint32_t) q->ne[1];
+    const bool kda = g->ne[0] == (int64_t) S && S > 1;
+    bool ok = node->type == GGML_TYPE_F32 && ggml_get_op_params_i32(node, 0) == 1 && v->ne[3] == 1 && q->ne[3] == 1 &&
+              S == t.rec_dim && H == t.rec_heads && kda == (t.rec_kda != 0) && H_k > 0 && H % H_k == 0 && q->ne[0] == (int64_t) S &&
+              n_tokens == t.n_tokens && n_tokens <= VK_KERYX_REC_TOKENS && k->nb[1] == q->nb[1] && k->nb[2] == q->nb[2];
+    for (int i = 0; i < 5; i++) {
+        ok = ok && node->src[i]->type == GGML_TYPE_F32 && node->src[i]->nb[0] == 4;
+    }
+    if (!ok) {
+        ggml_vk_keryx_fail(t, std::string("unsupported recurrent node ") + node->name + " for the record capture");
+        return;
+    }
+    vk_subbuffer sb[6];
+    uint32_t off[6];
+    const ggml_tensor * ts[6] = { q, k, v, g, b, node };
+    for (int i = 0; i < 6; i++) {
+        sb[i] = ggml_vk_tensor_subbuffer(ctx, ts[i], true);
+        const uint64_t mis = ggml_vk_tensor_buffer_offset(ctx, ts[i]) - sb[i].offset;
+        if (mis % 4 != 0) {
+            ggml_vk_keryx_fail(t, std::string("misaligned recurrent node ") + node->name + " for the record capture");
+            return;
+        }
+        off[i] = (uint32_t) (mis / 4);
+    }
+    vk_pipeline & pipe = ctx->device->pipeline_keryx_rec;
+    const vk_subbuffer out = { t.rec, 0, t.rec->size };
+    ggml_pipeline_request_descriptor_sets(ctx, pipe, 1);
+    ggml_vk_sync_buffers(ctx, subctx);
+    const vk_keryx_rec_push_constants pc = {
+        off[0], off[1], off[2], off[3], off[4], off[5],
+        (uint32_t) (q->nb[1] / 4), (uint32_t) (q->nb[2] / 4), (uint32_t) (v->nb[1] / 4), (uint32_t) (v->nb[2] / 4),
+        (uint32_t) (b->nb[1] / 4), (uint32_t) (b->nb[2] / 4),
+        H, H_k, S, kda ? 1u : 0u, t.rec_bytes / 4, (uint32_t) slot * H * VK_KERYX_REC_TOKENS * (t.rec_bytes / 4), VK_KERYX_REC_TOKENS,
+    };
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipe, { sb[0], sb[1], sb[2], sb[3], sb[4], sb[5], out }, pc, { H, n_tokens, 1 });
+    if (t.rec_ckpt_due) {
+        // The node's output: the S * H outputs of each token, then the state of every head.
+        const size_t state_bytes = (size_t) S * S * H * 4;
+        const size_t src_off = ggml_vk_tensor_buffer_offset(ctx, node) + (size_t) S * H * n_tokens * 4;
+        ggml_vk_buffer_copy_async(subctx, t.rec_ckpt, (size_t) slot * state_bytes, sb[5].buffer, src_off, state_bytes);
+    }
+    ggml_vk_sync_buffers(ctx, subctx);
+    t.rec_seen[slot] = 1;
+}
+
 // After `node`'s own dispatch: the leaves it carries. A product matmul carries its q8_1 input rows
 // (and its output rows when the product is plain); the GLU of a gated pair or split product, or
 // the bias add of a biased one, carries that product's output; a residual node carries its rows.
@@ -12490,6 +12579,14 @@ static void ggml_vk_keryx_on_node(ggml_backend_vk_context * ctx, vk_context & su
             return;
         }
         ggml_vk_keryx_lse(ctx, subctx, t, node, (uint32_t) il);
+    }
+    if (node->op == GGML_OP_GATED_DELTA_NET && t.rec) {
+        const int il = ggml_vk_keryx_layer_of(node->name, "__gdn__");
+        if (il < 0) {
+            ggml_vk_keryx_fail(t, std::string("recurrent node ") + node->name + " names no layer");
+            return;
+        }
+        ggml_vk_keryx_recur(ctx, subctx, t, node, (uint32_t) il);
     }
     const int leaf = ggml_vk_keryx_resid_leaf(t, node->name);
     if (leaf >= 0) {
@@ -15741,6 +15838,17 @@ int ggml_backend_vk_keryx_trace_ubatch_as(size_t dev_num, uint32_t pos_base, uin
         ggml_vk_keryx_fail(t, "the evaluation passes the " + std::to_string(t.max_pos) + " traced positions");
         return -5;
     }
+    if (t.rec) {
+        // Checkpoints are the states after whole intervals: one may only end a batch.
+        const uint64_t end = (uint64_t) pos_base + n_tokens;
+        const uint64_t crossed = end / t.rec_interval - pos_base / t.rec_interval;
+        if (n_tokens > VK_KERYX_REC_TOKENS || crossed > 1 || (crossed == 1 && end % t.rec_interval != 0)) {
+            ggml_vk_keryx_fail(t, "a batch of " + std::to_string(n_tokens) + " tokens at " + std::to_string(pos_base) + " splits a checkpoint interval");
+            return -5;
+        }
+        t.rec_ckpt_due = crossed == 1;
+        std::fill(t.rec_seen.begin(), t.rec_seen.end(), 0);
+    }
     t.pos_base = pos_base;
     t.n_tokens = n_tokens;
     t.declared = n_ubatch;
@@ -15853,6 +15961,108 @@ int ggml_backend_vk_keryx_trace_read_captures(size_t dev_num, uint8_t * out, siz
     t.cap_list.clear();
     t.cap_len.clear();
     return rc;
+}
+
+int ggml_backend_vk_keryx_recur_configure(size_t dev_num, const uint32_t * layers, uint32_t n, uint32_t interval) {
+    vk_device dev = ggml_vk_keryx_device(dev_num);
+    if (!dev || (n > 0 && (!layers || interval == 0))) {
+        return -1;
+    }
+    std::lock_guard<std::mutex> g(vk_keryx_mutex);
+    vk_keryx_trace & t = vk_keryx_traces[dev->idx];
+    if (!t.on || t.armed) {
+        return -1;
+    }
+    t.rec.reset();
+    t.rec_ckpt.reset();
+    t.rec_slot.clear();
+    t.rec_seen.clear();
+    t.rec_n = t.rec_heads = t.rec_dim = t.rec_kda = t.rec_bytes = t.rec_interval = 0;
+    if (n == 0) {
+        return 0;
+    }
+    // Rows of (layer, kind, slot, heads, head_dim); kind 3 = one decay per head, 4 = per key
+    // dimension. Every recurrent layer has the same heads and dimension.
+    const uint32_t kind = layers[1], heads = layers[3], dim = layers[4];
+    if ((kind != 3 && kind != 4) || heads == 0 || dim == 0 || dim > 128 || dim % 32 != 0) {
+        return -2;
+    }
+    std::vector<int> slot_of;
+    for (uint32_t i = 0; i < n; ++i) {
+        const uint32_t * r = layers + 5 * i;
+        if (r[1] != kind || r[3] != heads || r[4] != dim || r[2] >= n || r[0] >= 0x10000) {
+            return -2;
+        }
+        if (r[0] >= slot_of.size()) {
+            slot_of.resize(r[0] + 1, -1);
+        }
+        slot_of[r[0]] = (int) r[2];
+    }
+    const uint32_t rec_bytes = 8 * dim + 4 + (kind == 4 ? 2 * dim : 4);
+    try {
+        t.rec = ggml_vk_keryx_host_buffer(dev, (size_t) n * heads * VK_KERYX_REC_TOKENS * rec_bytes);
+        t.rec_ckpt = ggml_vk_keryx_host_buffer(dev, (size_t) n * heads * dim * dim * 4);
+    } catch (const std::exception &) {
+        t.rec.reset();
+        t.rec_ckpt.reset();
+        return -3;
+    }
+    if (!t.rec || !t.rec->ptr || !t.rec_ckpt || !t.rec_ckpt->ptr) {
+        t.rec.reset();
+        t.rec_ckpt.reset();
+        return -3;
+    }
+    t.rec_slot = std::move(slot_of);
+    t.rec_seen.assign(n, 0);
+    t.rec_n = n;
+    t.rec_heads = heads;
+    t.rec_dim = dim;
+    t.rec_kda = kind == 4 ? 1 : 0;
+    t.rec_bytes = rec_bytes;
+    t.rec_interval = interval;
+    return 0;
+}
+
+int ggml_backend_vk_keryx_recur_read(size_t dev_num, uint8_t * rec, size_t rec_cap, uint8_t * ckpt, size_t ckpt_cap, uint32_t * n_tokens, uint32_t * has_ckpt) {
+    vk_device dev = ggml_vk_keryx_device(dev_num);
+    if (!dev || !rec || !n_tokens || !has_ckpt) {
+        return -1;
+    }
+    {
+        // The batch's dispatches have all landed before its records are read.
+        vk_queue_handle & h = *dev->compute_queue->handle;
+        std::lock_guard<vk_queue_handle> q(h);
+        h.queue.waitIdle();
+    }
+    std::lock_guard<std::mutex> g(vk_keryx_mutex);
+    vk_keryx_trace & t = vk_keryx_traces[dev->idx];
+    if (!t.armed || !t.rec) {
+        return -1;
+    }
+    if (!t.error.empty()) {
+        return -9;
+    }
+    for (uint32_t s = 0; s < t.rec_n; ++s) {
+        if (!t.rec_seen[s]) {
+            ggml_vk_keryx_fail(t, "recurrent layer " + std::to_string(s) + " left no record of the batch at " + std::to_string(t.pos_base));
+            return -9;
+        }
+    }
+    const size_t per = (size_t) t.n_tokens * t.rec_bytes;
+    const size_t heads = (size_t) t.rec_n * t.rec_heads;
+    const size_t state = (size_t) t.rec_dim * t.rec_dim * 4;
+    if (rec_cap < heads * per || (t.rec_ckpt_due && (!ckpt || ckpt_cap < heads * state))) {
+        return -6;
+    }
+    for (size_t i = 0; i < heads; ++i) {
+        memcpy(rec + i * per, (const uint8_t *) t.rec->ptr + i * VK_KERYX_REC_TOKENS * t.rec_bytes, per);
+    }
+    if (t.rec_ckpt_due) {
+        memcpy(ckpt, t.rec_ckpt->ptr, heads * state);
+    }
+    *n_tokens = t.n_tokens;
+    *has_ckpt = t.rec_ckpt_due ? 1 : 0;
+    return 0;
 }
 
 int ggml_backend_vk_keryx_lse_configure(size_t dev_num, uint32_t n_layers, uint32_t n_heads) {

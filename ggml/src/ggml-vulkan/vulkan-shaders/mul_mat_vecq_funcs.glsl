@@ -4,6 +4,25 @@
 
 #include "types.glsl"
 
+// `x` rounded to the nearest half-precision value, ties to even (the verifier's `f16::round`).
+float keryx_round_f16(float x) {
+    const uint b = floatBitsToUint(x);
+    const int e = int((b >> 23) & 0xFFu) - 112;  // half exponent
+    if (e >= 31) {
+        return uintBitsToFloat((b & 0x80000000u) | 0x7F800000u);
+    }
+    if (e <= 0) {
+        // Subnormal halves: steps of 2^-24.
+        return roundEven(x * 16777216.0) / 16777216.0;
+    }
+    const uint rest = b & 0x1FFFu;
+    uint r = b & ~0x1FFFu;
+    if (rest > 0x1000u || (rest == 0x1000u && (b & 0x2000u) != 0u)) {
+        r += 0x2000u;
+    }
+    return uintBitsToFloat(r);
+}
+
 #if defined(DATA_A_Q2_0)
 FLOAT_TYPE get_dm(uint ib) {
     return FLOAT_TYPE(data_a[ib / 2].d);
@@ -375,6 +394,15 @@ FLOAT_TYPE mmvq_dot_product(const uint ib_a, const uint iqs) {
     q_sum += dotPacked4x8EXT(qs_a.y, cache_b_qs[1]);
     q_sum += dotPacked4x8EXT(qs_a.z, cache_b_qs[2]);
     q_sum += dotPacked4x8EXT(qs_a.w, cache_b_qs[3]);
+
+    // Keryx canonical trace, a batch committed past 8 tokens: CUDA's MMQ tile form, which the
+    // verifier recomputes such a product with (`quant::k_tile_form`): the sub-block scale d*sc and
+    // min dmin*m each rounded to f16, the min term on the block's stored sum s (half of it here, as
+    // these are 16 of the block's 32 activations).
+    if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_KERYX_DS4) != 0) {
+        return FLOAT_TYPE(float(cache_b_ds.x) * keryx_round_f16(float(dm_scale.x)) * float(q_sum)
+                          - 0.5 * keryx_round_f16(float(dm_scale.y)) * float(cache_b_ds.y));
+    }
 
     // Keryx canonical trace: the min term takes the exact sum of these 16 quantized activations,
     // as CUDA's MMVQ does, not half of the block's stored f16 sum — that rounding alone exceeds the
