@@ -15609,6 +15609,12 @@ void ggml_backend_vk_get_device_description(int device, char * description, size
 // duplicate copy. Buffer device addresses are only dereferenceable on the device
 // that owns them, so the external kernel builds its pipeline on THIS VkDevice and
 // submits through the guarded submit hook below.
+//
+// `dev_num` here and in the trace calls is a ggml device index (an index into
+// vk_instance.device_indices), the same index the backend context is created with.
+// ggml_vk_get_device maps it to the physical device itself; mapping it here as well
+// picks the wrong slot whenever the device is not physical device 0 (an iGPU listed
+// first, or GGML_VK_VISIBLE_DEVICES pinning another card).
 
 bool ggml_backend_vk_keryx_raw_handles(size_t dev_num, void ** vk_instance_out,
                                        void ** vk_physical_device, void ** vk_device_out,
@@ -15618,7 +15624,7 @@ bool ggml_backend_vk_keryx_raw_handles(size_t dev_num, void ** vk_instance_out,
         if (dev_num >= vk_instance.device_indices.size()) {
             return false;
         }
-        vk_device dev = ggml_vk_get_device(vk_instance.device_indices[dev_num]);
+        vk_device dev = ggml_vk_get_device(dev_num);
         if (!dev->buffer_device_address) {
             return false; // no BDA → tensors cannot be reached by raw address
         }
@@ -15649,7 +15655,7 @@ bool ggml_backend_vk_keryx_tensor_addr(const struct ggml_tensor * tensor,
 }
 
 void ggml_backend_vk_keryx_queue_submit(size_t dev_num, const void * submit_info, void * fence) {
-    vk_device dev = ggml_vk_get_device(vk_instance.device_indices[dev_num]);
+    vk_device dev = ggml_vk_get_device(dev_num);
     // The queue handle's own submit takes the lock every internal ggml_vk_submit takes (none
     // when the queue is internally synchronized): external dispatches can never race ggml's own
     // submissions on the shared compute queue.
@@ -15668,7 +15674,7 @@ static vk_device ggml_vk_keryx_device(size_t dev_num) {
     if (dev_num >= vk_instance.device_indices.size()) {
         return nullptr;
     }
-    vk_device dev = ggml_vk_get_device(vk_instance.device_indices[dev_num]);
+    vk_device dev = ggml_vk_get_device(dev_num);
     return dev && dev->idx < GGML_VK_MAX_DEVICES ? dev : nullptr;
 }
 
